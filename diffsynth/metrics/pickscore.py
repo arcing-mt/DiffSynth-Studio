@@ -1,7 +1,7 @@
 from transformers import AutoProcessor
 import torch
 from ..core import ModelConfig
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..models.pickscore import PickScoreModel
 from .base import Metric
 

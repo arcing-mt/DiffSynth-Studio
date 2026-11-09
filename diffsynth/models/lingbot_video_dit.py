@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from ..core.attention import attention_forward
 from ..core.gradient import gradient_checkpoint_forward
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 
 
 def get_timestep_embedding(

@@ -5,7 +5,7 @@ try:
 except:
     warnings.warn(f"Cannot import `SiglipVisionModel`. `Siglip2ImageEncoder` is not available. Please update `transformers` by `pip install -U transformers`.")
     SiglipVisionModel = torch.nn.Module
-from diffsynth.core.device.npu_compatible_device import get_device_type
+from diffsynth.core.device.compatible_device import get_device_type
 
 
 class Siglip2ImageEncoder(SiglipVisionModel):

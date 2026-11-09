@@ -5,7 +5,7 @@ from typing import Optional, Union
 from tqdm import tqdm
 from PIL import Image
 
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..diffusion import FlowMatchScheduler
 from ..core import ModelConfig
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit

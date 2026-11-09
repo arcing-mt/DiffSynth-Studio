@@ -8,7 +8,7 @@ from PIL import Image
 from tqdm import tqdm
 from typing import Optional, Union
 
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..core import ModelConfig
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 from ..diffusion.flow_match import FlowMatchScheduler

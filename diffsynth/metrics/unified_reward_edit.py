@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoProcessor
 from ..core import ModelConfig
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..models.unified_reward_edit import UnifiedRewardEditModel
 from .base import Metric
 from transformers.utils import logging

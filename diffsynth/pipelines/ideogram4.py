@@ -4,7 +4,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..diffusion import FlowMatchScheduler
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 from ..core import ModelConfig

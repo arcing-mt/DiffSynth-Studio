@@ -4,7 +4,7 @@ import numpy as np
 from einops import repeat, reduce
 from typing import Union
 from ..core import AutoTorchModule, AutoWrappedLinear, LoRAHotLoadMixin, load_state_dict, ModelConfig, parse_device_type, enable_vram_management
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..utils.lora import GeneralLoRALoader
 from ..models.model_loader import ModelPool
 from ..utils.controlnet import ControlNetInput

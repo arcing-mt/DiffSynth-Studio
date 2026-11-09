@@ -1,7 +1,7 @@
 import torch, os, importlib, warnings, json, inspect
 from typing import Dict, List, Tuple, Union
 from ..core import ModelConfig, load_model
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..utils.lora.merge import merge_lora
 
 

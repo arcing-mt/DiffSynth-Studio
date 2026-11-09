@@ -1,7 +1,7 @@
 import torch
 from transformers import BertTokenizer
 from ..core import ModelConfig
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..models.image_reward import ImageRewardModel
 from .base import Metric
 

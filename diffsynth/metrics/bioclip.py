@@ -1,7 +1,7 @@
 import torch
 from transformers import CLIPTokenizer
 from ..core import ModelConfig
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..models.bioclip import BioCLIPv2Compute
 from .base import Metric
 

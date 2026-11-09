@@ -4,7 +4,7 @@ try:
 except:
     warnings.warn(f"Cannot import `DINOv3ViTModel`. `DINOv3ImageEncoder` is not available. Please update `transformers` by `pip install -U transformers`.")
     DINOv3ViTModel = torch.nn.Module
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 
 
 class DINOv3ImageEncoder(DINOv3ViTModel):

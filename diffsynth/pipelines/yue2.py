@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from ..core import ModelConfig
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 from ..diffusion.flow_match import FlowMatchScheduler
 from ..models.yue2_mot import StaticKVCache, YuE2MoT

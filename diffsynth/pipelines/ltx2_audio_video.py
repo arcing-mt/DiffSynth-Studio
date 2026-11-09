@@ -9,7 +9,7 @@ from PIL import Image
 from tqdm import tqdm
 from typing import Optional
 
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..diffusion import AncestralFlowMatchScheduler, FlowMatchScheduler
 from ..core import ModelConfig
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit

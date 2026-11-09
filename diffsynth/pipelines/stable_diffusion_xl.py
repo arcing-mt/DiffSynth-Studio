@@ -3,7 +3,7 @@ from PIL import Image
 from tqdm import tqdm
 from typing import Union
 
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..diffusion.ddim_scheduler import DDIMScheduler
 from ..core import ModelConfig
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit

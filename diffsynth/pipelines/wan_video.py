@@ -11,7 +11,7 @@ from typing import Optional
 from typing_extensions import Literal
 from transformers import Wav2Vec2Processor
 
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..diffusion import FlowMatchScheduler
 from ..core import ModelConfig, gradient_checkpoint_forward
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
@@ -147,7 +147,7 @@ class WanVideoPipeline(BasePipeline):
             from ..utils.xfuser import initialize_usp
             initialize_usp(device)
             import torch.distributed as dist
-            from ..core.device.npu_compatible_device import get_device_name
+            from ..core.device.compatible_device import get_device_name
             if dist.is_available() and dist.is_initialized():
                 device = get_device_name()
         # Initialize pipeline

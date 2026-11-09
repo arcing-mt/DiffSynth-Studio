@@ -1,7 +1,7 @@
 from transformers import AutoProcessor
 import torch
 from ..core import ModelConfig
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..models.hpsv3 import HPSv3Model
 from .base import Metric
 

@@ -5,7 +5,7 @@ from tqdm import tqdm
 from transformers import Qwen2Tokenizer
 
 from ..core import ModelConfig
-from ..core.device.npu_compatible_device import get_device_type
+from ..core.device.compatible_device import get_device_type
 from ..diffusion import FlowMatchScheduler
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 from ..models.sensenova_u1_dit import SenseNovaU1DiT
