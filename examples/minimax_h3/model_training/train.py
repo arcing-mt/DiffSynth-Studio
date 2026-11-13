@@ -154,7 +154,27 @@ def minimax_h3_parser():
     parser.add_argument("--silent_on_missing_audio", default=False, action="store_true", help="Whether to use silent audio as a fallback when no audio track is present in the video data.")
     parser.add_argument("--training_cfg_scale", type=float, default=1.0, help="Inverse-CFG scale for preserving MiniMax-H3 guidance distillation during fine-tuning. Values greater than 1 enable a no-grad unconditional branch; 1 keeps the standard flow-matching loss.")
     parser.add_argument("--audio_loss_weight", type=float, default=1.0, help="Weight of the audio term in the MiniMax-H3 loss. 1 keeps video and audio equally weighted; 0 trains on the video term only while the audio stream is still noised and forwarded.")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping threshold for FSDP2 training. Set to 0 to disable. DeepSpeed uses its own configuration.")
     return parser
+
+
+def minimax_h3_accelerator(args):
+    accelerator = accelerate.Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
+    )
+    if getattr(accelerator, "is_fsdp2", False) and accelerator.mixed_precision == "bf16":
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        # H3 prepares its own BF16 activations. Preserve FP64 position IDs,
+        # FP32 RoPE angles passed to blocks, and the FP32 training loss.
+        accelerator.state.fsdp_plugin.mixed_precision_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            output_dtype=None,
+            cast_forward_inputs=False,
+        )
+    return accelerator
 
 
 if __name__ == "__main__":
@@ -165,10 +185,7 @@ if __name__ == "__main__":
             f"--num_frames must be {MINIMAX_H3_TIME_DIVISION_FACTOR}n+{MINIMAX_H3_TIME_DIVISION_REMAINDER} "
             f"(e.g. 39, 56, 124) so it lands on the video VAE's temporal grouping, got {args.num_frames}."
         )
-    accelerator = accelerate.Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
-    )
+    accelerator = minimax_h3_accelerator(args)
     video_processor = UnifiedDataset.default_video_operator(
         base_path=args.dataset_base_path,
         max_pixels=args.max_pixels,

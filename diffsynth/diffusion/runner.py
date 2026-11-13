@@ -95,7 +95,12 @@ def launch_training_task(
     else:
         model.to(device=accelerator.device)
         exclude_quantized_params_from_ddp_sync(accelerator, model)
+        pipe, computation_dtype = model.pipe, model.pipe.torch_dtype
         model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+        if getattr(accelerator, "is_fsdp2", False) and accelerator.mixed_precision == "bf16":
+            # Accelerate upcasts parameter storage through model.to(float32).
+            # Pipeline input precision must remain independent of that storage.
+            pipe.torch_dtype = computation_dtype
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
     for epoch_id in range(num_epochs):
@@ -106,6 +111,10 @@ def launch_training_task(
                 else:
                     loss = model(data)
                 accelerator.backward(loss)
+                if getattr(accelerator, "is_fsdp2", False) and accelerator.sync_gradients:
+                    max_grad_norm = getattr(args, "max_grad_norm", 0.0)
+                    if max_grad_norm > 0:
+                        accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                 if enable_model_cpu_offload:
                     offload_manager.after_backward()
                 optimizer.step()
