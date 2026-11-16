@@ -164,6 +164,7 @@ def minimax_h3_parser():
     parser.add_argument("--training_cfg_scale", type=float, default=1.0, help="Inverse-CFG scale for preserving MiniMax-H3 guidance distillation during fine-tuning. Values greater than 1 enable a no-grad unconditional branch; 1 keeps the standard flow-matching loss.")
     parser.add_argument("--audio_loss_weight", type=float, default=1.0, help="Weight of the audio term in the MiniMax-H3 loss. 1 keeps video and audio equally weighted; 0 trains on the video term only while the audio stream is still noised and forwarded.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping threshold for FSDP2 training. Set to 0 to disable. DeepSpeed uses its own configuration.")
+    parser.add_argument("--disable_model_save", default=False, action="store_true", help="Disable all model checkpoint saves, including epoch/end-of-training saves and state-dict gathering. Configured logs/profiles and preprocessing caches are unaffected.")
     return parser
 
 
@@ -259,6 +260,7 @@ if __name__ == "__main__":
         enable_wandb_log=args.enable_wandb_log,
         wandb_project=args.wandb_project,
         enable_csv_log=args.enable_csv_log,
+        disable_model_save=args.disable_model_save,
     )
     launcher_map = {
         "sft:data_process": launch_data_process_task,

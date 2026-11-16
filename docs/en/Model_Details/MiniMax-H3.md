@@ -256,6 +256,7 @@ Models in the MiniMax-H3 series are trained uniformly via [`examples/minimax_h3/
         * `--output_path`: Path to save the model.
         * `--remove_prefix_in_ckpt`: Remove prefix in the model's state dict.
         * `--save_steps`: Interval in training steps to save the model.
+        * `--disable_model_save`: Disable step, epoch, and end-of-training model saves, including synchronization and weight gathering for saving. Disabled by default; takes precedence over `--save_steps`. Logs, profiler traces, and preprocessing caches still follow their existing settings.
     * LoRA Configuration
         * `--lora_base_model`: Which model to add LoRA to.
         * `--lora_target_modules`: Which layers to add LoRA to.

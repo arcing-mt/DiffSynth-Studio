@@ -256,6 +256,7 @@ MiniMax-H3 系列模型统一通过 [`examples/minimax_h3/model_training/train.p
         * `--output_path`: 模型保存路径。
         * `--remove_prefix_in_ckpt`: 在模型文件的 state dict 中移除前缀。
         * `--save_steps`: 保存模型的训练步数间隔。
+        * `--disable_model_save`: 禁用按步、按 epoch 和训练结束时的模型保存，同时跳过保存所需的进程同步和权重聚合。默认关闭；开启后优先于 `--save_steps`，日志、profiler trace 和数据预处理缓存仍按原配置输出。
     * LoRA 配置
         * `--lora_base_model`: LoRA 添加到哪个模型上。
         * `--lora_target_modules`: LoRA 添加到哪些层上。

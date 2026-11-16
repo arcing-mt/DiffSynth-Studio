@@ -75,11 +75,13 @@ class ModelLogger:
         enable_swanlab_log=False, swanlab_project="DiffSynth-Studio",
         enable_wandb_log=False, wandb_project="DiffSynth-Studio",
         enable_csv_log=False,
+        disable_model_save=False,
     ):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
+        self.disable_model_save = disable_model_save
         # Loggers
         self.enable_tensorboard_log = enable_tensorboard_log
         self.enable_swanlab_log = enable_swanlab_log
@@ -110,19 +112,21 @@ class ModelLogger:
             if loss is not None:
                 for logger in self.loggers:
                     logger.log("loss", loss, self.num_steps)
-        if save_steps is not None and self.num_steps % save_steps == 0:
+        if not self.disable_model_save and save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 
     def on_epoch_end(self, accelerator: Accelerator, model: torch.nn.Module, epoch_id):
         self.save_model(accelerator, model, f"epoch-{epoch_id}.safetensors")
 
     def on_training_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None):
-        if save_steps is not None and self.num_steps % save_steps != 0:
+        if not self.disable_model_save and save_steps is not None and self.num_steps % save_steps != 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
         for logger in self.loggers:
             logger.close()
 
     def save_model(self, accelerator: Accelerator, model: torch.nn.Module, file_name):
+        if self.disable_model_save:
+            return
         accelerator.wait_for_everyone()
         state_dict = accelerator.get_state_dict(model)
         if accelerator.is_main_process:
