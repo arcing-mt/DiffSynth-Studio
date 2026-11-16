@@ -14,6 +14,23 @@ pip install -e .
 
 For more information on installation, please refer to [Setup Dependencies](../Pipeline_Usage/Setup.md).
 
+## MUSA Kernel Optimization
+
+Set either independent environment switch before launching standard MiniMax-H3 training. Both default to disabled:
+
+```shell
+export MINIMAX_H3_MUSA_FUSED_ROPE=1
+export MINIMAX_H3_MUSA_FUSED_SWIGLU=1
+```
+
+`MINIMAX_H3_MUSA_FUSED_ROPE` replaces DiT attention's half-split partial RoPE with `torch.rope`, preserving the unrotated dimensions (normally the first 96 of 128 head dimensions are rotated). The kernel consumes shared FP32 angles and computes cos/sin internally; Python does not precompute cos/sin on this path. When disabled, cos/sin are computed once per forward and reused by all layers' Q/K operations and gradient checkpoint recomputation.
+
+`MINIMAX_H3_MUSA_FUSED_SWIGLU` replaces `silu(gate) * up` with `aten.swish_glu` and its registered fused backward in both DiT and token-refiner MLPs. Both switches accept `1/0`, `true/false`, `yes/no`, and `on/off`. Regardless of these switches, DiT and token-refiner `cu_seqlens` are each converted to host boundaries once per forward and shared across their layers.
+
+After loading the pipeline, `examples/minimax_h3/model_training/train.py` calls `apply_minimax_h3_musa_patch(self.pipe.dit)` to enable these four optimizations on the standard H3 DiT, preserving parameters and checkpoint keys. CPU initialization followed by moving to MUSA is supported: dispatch checks the actual tensor device and dtype, and non-MUSA inputs use the original operators. Loading an inference pipeline alone does not install the patch. Comfy, VDN, and ControlNet are outside this optimization's scope. For manually constructed standard H3 training models, import `apply_minimax_h3_musa_patch` from `diffsynth.core.musa_patch` and call `apply_minimax_h3_musa_patch(model)` before distributed wrapping.
+
+The fused operators require the corresponding APIs in torch-musa. They can differ from the original BF16 expressions due to rounding, so keep other settings fixed when comparing training results or performance. Use `PROFILE_ENABLE=1` to inspect the selected kernels and their durations.
+
 ## Quick Start
 
 Running the following code will quickly load the [DiffSynth-Studio/MiniMax-H3-NF4](https://www.modelscope.cn/models/DiffSynth-Studio/MiniMax-H3-NF4) NF4-quantized model and perform text-to-video-audio inference. VRAM management is enabled, and the framework automatically controls the loading of model parameters based on available VRAM, requiring a minimum of 7GB VRAM.

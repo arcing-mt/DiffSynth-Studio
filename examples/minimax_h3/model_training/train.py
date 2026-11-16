@@ -1,6 +1,7 @@
 import torch, os, argparse, accelerate
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.profiler import profile_scope
+from diffsynth.core.musa_patch import apply_minimax_h3_musa_patch
 from diffsynth.core.data.operators import LoadAudioWithTorchaudio, ToAbsolutePath
 from diffsynth.utils.data.minimax_h3 import MiniMaxH3ReferenceLoader
 from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3Pipeline, ModelConfig
@@ -45,6 +46,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         if processor_path is not None:
             pipe_kwargs["processor_config"] = self.parse_path_or_model_id(processor_path)
         self.pipe = MiniMaxH3Pipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, **pipe_kwargs)
+        apply_minimax_h3_musa_patch(self.pipe.dit)
         self.pipe = self.load_training_template_model(self.pipe, template_model_id_or_path, use_gradient_checkpointing, use_gradient_checkpointing_offload)
         self.pipe = self.split_pipeline_units(
             task, self.pipe, trainable_models, lora_base_model,

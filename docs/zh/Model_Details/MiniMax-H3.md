@@ -14,6 +14,23 @@ pip install -e .
 
 更多关于安装的信息，请参考[安装依赖](../Pipeline_Usage/Setup.md)。
 
+## MUSA 算子优化
+
+在启动普通 MiniMax-H3 训练之前，可通过两个独立环境变量开启 MUSA 融合算子，默认均关闭：
+
+```shell
+export MINIMAX_H3_MUSA_FUSED_ROPE=1
+export MINIMAX_H3_MUSA_FUSED_SWIGLU=1
+```
+
+`MINIMAX_H3_MUSA_FUSED_ROPE` 使用 `torch.rope` 替换 DiT attention 的 half-split partial RoPE，保留未旋转的维度（默认旋转 head 的前 96/128 维）。kernel 直接接收共享的 FP32 角度表，内部计算 cos/sin，Python 侧不会额外预计算 cos/sin。关闭这个开关时，每次 forward 预计算一次 cos/sin，供各层 Q/K 和梯度 checkpoint 重计算复用。
+
+`MINIMAX_H3_MUSA_FUSED_SWIGLU` 使用 `aten.swish_glu` 及其已注册的融合反向替换 `silu(gate) * up`，覆盖 DiT 和 token refiner 的 MLP。两个开关均支持 `1/0`、`true/false`、`yes/no`、`on/off`。无论是否开启融合算子，DiT 和 token refiner 各自的 `cu_seqlens` 都只在每次 forward 转换一次主机端边界，供所有层复用。
+
+`examples/minimax_h3/model_training/train.py` 在加载 pipeline 后调用 `apply_minimax_h3_musa_patch(self.pipe.dit)`，仅对普通 H3 DiT 启用这四项优化，不修改权重或 checkpoint 键名。先在 CPU 初始化再搬到 MUSA 也能生效；执行时会检查 tensor 的设备和 dtype，非 MUSA 输入使用原算子。单独加载推理 pipeline 不会安装补丁。Comfy、VDN 和 ControlNet 不在此次优化范围内。手动构建普通 H3 训练模型时，可在分布式包装前调用 `from diffsynth.core.musa_patch import apply_minimax_h3_musa_patch` 后执行 `apply_minimax_h3_musa_patch(model)`。
+
+融合算子需要当前 torch-musa 提供相应 API。它们与原有 BF16 逐算子计算存在舍入差异，进行训练效果或性能对比时请保持其他配置一致。可以结合 `PROFILE_ENABLE=1` 检查实际 kernel 和耗时。
+
 ## 快速开始
 
 运行以下代码可以快速加载 [DiffSynth-Studio/MiniMax-H3-NF4](https://www.modelscope.cn/models/DiffSynth-Studio/MiniMax-H3-NF4) NF4 量化模型并进行文生音视频推理。显存管理已启动，框架会自动根据剩余显存控制模型参数的加载，最低 7G 显存即可运行。

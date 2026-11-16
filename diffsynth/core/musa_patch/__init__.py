@@ -1,0 +1,1 @@
+from .minimax_h3 import apply_minimax_h3_musa_patch

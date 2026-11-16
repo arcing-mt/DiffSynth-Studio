@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from ..core.attention import attention_forward
 from ..core.gradient import gradient_checkpoint_forward
+from ..core.musa_patch.minimax_h3 import can_use_musa_rope
 
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
 _PATCH_T, _PATCH_H, _PATCH_W = 1, 2, 2
@@ -49,11 +50,21 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def _prepare_rope(freqs, dtype, fused_rope=False):
+    if freqs is None:
+        return None, None
+    # The MUSA kernel consumes angles directly, so this path needs no cos/sin.
+    if fused_rope and can_use_musa_rope(freqs, dtype):
+        return None, None
+    return torch.cos(freqs).to(dtype).unsqueeze(1), torch.sin(freqs).to(dtype).unsqueeze(1)
+
+
+def _apply_rope(x: torch.Tensor, freqs: torch.Tensor, rope_cos=None, rope_sin=None) -> torch.Tensor:
     rot_dim = freqs.shape[-1]
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    cos = torch.cos(freqs).to(x.dtype).unsqueeze(1)
-    sin = torch.sin(freqs).to(x.dtype).unsqueeze(1)
+    if rope_cos is None or rope_sin is None:
+        rope_cos, rope_sin = _prepare_rope(freqs, x.dtype)
+    cos, sin = rope_cos.to(x.dtype), rope_sin.to(x.dtype)
     x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
     return torch.cat((x_rot, x_pass), dim=-1)
 
@@ -67,9 +78,13 @@ def _modulate_gate(x, gate, other, indices):
     return (x + gate.index_select(0, indices) * other).to(x.dtype)
 
 
+def _seqlen_bounds(cu_seqlens):
+    return tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else tuple(cu_seqlens)
+
+
 def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
     out = torch.empty_like(q)
-    bounds = cu_seqlens.tolist()
+    bounds = _seqlen_bounds(cu_seqlens)
     for start, stop in zip(bounds[:-1], bounds[1:]):
         if stop == start:
             continue
@@ -133,7 +148,10 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
 
-    def forward(self, x, *, rope_freqs, cu_seqlens, max_seqlen=None):
+    def apply_rotary_emb(self, x, freqs, rope_cos=None, rope_sin=None):
+        return _apply_rope(x, freqs, rope_cos, rope_sin)
+
+    def forward(self, x, *, rope_freqs, cu_seqlens, max_seqlen=None, rope_cos=None, rope_sin=None):
         total = x.shape[0]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
@@ -143,8 +161,8 @@ class MiniMaxH3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         if rope_freqs is not None:
-            q = _apply_rope(q, rope_freqs)
-            k = _apply_rope(k, rope_freqs)
+            q = self.apply_rotary_emb(q, rope_freqs, rope_cos, rope_sin)
+            k = self.apply_rotary_emb(k, rope_freqs, rope_cos, rope_sin)
         out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
@@ -156,11 +174,12 @@ class MiniMaxH3MLP(nn.Module):
         self.fc1 = nn.Linear(hidden_size, ffn_hidden_size * 2, bias=False)
         self.fc2 = nn.Linear(ffn_hidden_size, hidden_size, bias=False)
 
-    def forward(self, x):
-        hidden = self.fc1(x)
+    def activation(self, hidden):
         gate, up = hidden.chunk(2, dim=-1)
-        hidden = nn.functional.silu(gate) * up
-        return self.fc2(hidden)
+        return nn.functional.silu(gate) * up
+
+    def forward(self, x):
+        return self.fc2(self.activation(self.fc1(x)))
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -206,6 +225,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
         self.final_norm = _norm(hidden_size, eps=final_norm_eps)
 
     def forward(self, x, *, cu_seqlens, max_seqlen):
+        if getattr(self, "_share_attention_inputs", False):
+            cu_seqlens = _seqlen_bounds(cu_seqlens)
         for block in self.blocks:
             x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         return self.final_norm(x)
@@ -220,12 +241,13 @@ class MiniMaxH3DiTBlock(nn.Module):
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
         self.adaln_proj = MiniMaxH3AdalnProj(hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM)
 
-    def forward(self, x, *, t_emb, combined_indices, rope_freqs, cu_seqlens, max_seqlen):
+    def forward(self, x, *, t_emb, combined_indices, rope_freqs, cu_seqlens, max_seqlen, rope_cos=None, rope_sin=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices)
-        h = self.attn(h, rope_freqs=rope_freqs, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        rope_inputs = {} if rope_cos is None and rope_sin is None else dict(rope_cos=rope_cos, rope_sin=rope_sin)
+        h = self.attn(h, rope_freqs=rope_freqs, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, **rope_inputs)
         x = _modulate_gate(residual, gate_msa, h, combined_indices)
         residual = x
         h = self.norm2(x)
@@ -358,12 +380,13 @@ class MiniMaxH3DiT(nn.Module):
         device = x.device
 
         rope_freqs = self.rope(img_position_ids).to(device)
+        share_attention_inputs = getattr(self, "_share_attention_inputs", False)
 
         decoder_input, t_emb = self._embed(
             x=x, audio_x=audio_x, text_embeddings_selected=text_selected,
             unique_timesteps=unique_timesteps.view(-1).to(device),
             img_pos=img_pos.to(device), audio_pos=audio_pos.to(device), text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device), refiner_max_seqlen=refiner_max,
+            refiner_cu_seqlens=refiner_cu if share_attention_inputs else refiner_cu.to(device), refiner_max_seqlen=refiner_max,
             seq_len=seq_len, device=device,
         )
 
@@ -371,7 +394,14 @@ class MiniMaxH3DiT(nn.Module):
         inverse_indices = inverse_indices.to(device)
 
         hidden = decoder_input
-        cu_seqlens = cu_seqlens.to(device)
+        # Prepare once, outside the blocks and their checkpoint recomputations.
+        rope_inputs = {}
+        if share_attention_inputs:
+            rope_cos, rope_sin = _prepare_rope(rope_freqs, hidden.dtype, getattr(self, "musa_fused_rope", False))
+            rope_inputs = dict(rope_cos=rope_cos, rope_sin=rope_sin)
+            cu_seqlens = _seqlen_bounds(cu_seqlens)
+        else:
+            cu_seqlens = cu_seqlens.to(device)
         for block_id, block in enumerate(self.blocks):
             hidden = gradient_checkpoint_forward(
                 block,
@@ -383,6 +413,7 @@ class MiniMaxH3DiT(nn.Module):
                 rope_freqs=rope_freqs,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                **rope_inputs,
             )
             if control_hints is not None and block_id in control_hints:
                 hidden = hidden + control_hints[block_id].to(hidden.device, hidden.dtype)
