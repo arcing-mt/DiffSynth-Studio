@@ -402,7 +402,18 @@ class MiniMaxH3DiT(nn.Module):
             cu_seqlens = _seqlen_bounds(cu_seqlens)
         else:
             cu_seqlens = cu_seqlens.to(device)
+        cast_checkpoint_inputs = getattr(self, "_fsdp2_cast_forward_inputs", False)
+        if cast_checkpoint_inputs:
+            # FSDP skips its forward input cast during checkpoint replay.
+            # Save inputs in the actual compute dtype outside that boundary.
+            rope_freqs = rope_freqs.to(decoder_input.dtype)
         for block_id, block in enumerate(self.blocks):
+            # Only hidden activations need to return to the next block's
+            # compute dtype. Do not downcast positions/angles just because a
+            # previous FSDP block used a different output dtype. Cast outside
+            # checkpoint so replay sees the same inputs as the first forward.
+            if hidden.dtype != decoder_input.dtype:
+                hidden = hidden.to(decoder_input.dtype)
             hidden = gradient_checkpoint_forward(
                 block,
                 use_gradient_checkpointing,
@@ -418,6 +429,10 @@ class MiniMaxH3DiT(nn.Module):
             if control_hints is not None and block_id in control_hints:
                 hidden = hidden + control_hints[block_id].to(hidden.device, hidden.dtype)
 
+        # FSDP blocks may cast their outputs; the unwrapped final head still
+        # computes in the root module's parameter/input dtype.
+        if hidden.dtype != decoder_input.dtype:
+            hidden = hidden.to(decoder_input.dtype)
         video_logits, audio_logits = self.final_layer(hidden, t_emb=t_emb, inverse_indices=inverse_indices)
 
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))

@@ -14,6 +14,44 @@ pip install -e .
 
 更多关于安装的信息，请参考[安装依赖](../Pipeline_Usage/Setup.md)。
 
+## FSDP2 训练选项
+
+H3 训练脚本支持以下 `--fsdp2_*` 选项，需使用 FSDP2 的 Accelerate 启动配置。未指定时保留当前默认行为；布尔值可写 `true/false` 或 `1/0`，也可省略值表示 `true`。
+
+|选项|默认行为|作用|
+|-|-|-|
+|`--fsdp2_sync_each_batch`|`false`|每个 microstep 都同步梯度，同时仍按 `--gradient_accumulation_steps` 累积并更新参数；开启可避免累积期间保留完整梯度，但增加通信|
+|`--fsdp2_reshard_after_backward`|`true`|每次 backward 后重新分片参数；设为 `false` 时在累积中间步保留参数，减少下一次 forward 的 all-gather，但增加显存；更新参数前的最后一步始终重新分片|
+|`--fsdp2_param_dtype`|`auto`|未分片参数的计算精度：`bfloat16`、`float16`、`float32`；`auto` 跟随启动配置。显式指定时也同步设置 Accelerate 的精度模式、H3 权重加载及输入 dtype；FP16 使用对应的梯度缩放，FP32 使用 `mixed_precision=no`|
+|`--fsdp2_reduce_dtype`|`auto`|梯度归约精度：`bfloat16`、`float16`、`float32`；`auto` 使用计算精度|
+|`--fsdp2_output_dtype`|`none`|FSDP 模块输出精度：`none`、`bfloat16`、`float16`、`float32`；`none` 不转换输出。此策略也作用于根训练模块返回的 loss|
+|`--fsdp2_cast_forward_inputs`|`false`|是否将 FSDP 的浮点输入转换到计算精度。H3 默认关闭以保留 FP64 位置和 FP32 RoPE 角度；开启会改变这些张量的精度。与输出精度独立配置|
+|`--fsdp2_forward_prefetch`|`0`|显式预取后续几个 DiT block；`0` 不设置显式 forward 预取|
+|`--fsdp2_backward_prefetch`|`0`|显式预取前面几个 DiT block；`0` 保留 PyTorch 自动 backward 预取，并非禁用预取|
+|`--fsdp2_dp_replicate_size`|不覆盖启动配置|HSDP 复制组大小；只指定这一项时，从 world size 推导分片组大小|
+|`--fsdp2_dp_shard_size`|不覆盖启动配置|FSDP/HSDP 分片组大小；只指定这一项时，从 world size 推导复制组大小|
+|`--fsdp2_hsdp_defer_all_reduce`|`false`|每个 microstep 保留 reduce-scatter，只把复制组 all-reduce 延迟到 optimizer 更新前；要求 HSDP 且 `fsdp2_sync_each_batch=true`，不满足时直接报错|
+
+`param_dtype` 控制计算参数，Accelerate 混合精度下的 FP32 参数分片/optimizer 存储不由这个选项直接改变。使用全 FP32 计算时，应选择支持 FP32 的 attention 后端，例如设置 `DIFFSYNTH_ATTENTION_IMPLEMENTATION=torch`，因为 FlashAttention 仅支持 FP16/BF16。参数重新分片与梯度同步是独立控制项。预取深度越大，可能同时保留更多完整参数。HSDP 要求复制组大小与分片组大小的乘积等于总进程数；复制组大于 1 时，分片组也必须大于 1。默认每次 HSDP 梯度同步包括 reduce-scatter 和复制组 all-reduce；开启延迟选项后，两级通信分别按 microstep 和 optimizer 更新边界执行，尾部不足一个累积窗口时也会完成 all-reduce。
+
+输出与计算 dtype 不同时，只在进入后续 block 或输出头前将 hidden 激活转回计算 dtype，不要求转换位置或 RoPE 角度。显式选择不同输出 dtype 仍会产生输出转换及必要的激活转回；同精度、同策略的 H3 block 通常保留 `output_dtype=none` 即可。`reshard_after_backward=false` 只在累积窗口首尾切换状态，训练正常结束或异常退出时恢复默认状态。
+
+默认归约精度仍跟随计算精度，预取仍是两个独立的层数配置。HSDP 中同时设置 `fsdp2_sync_each_batch=true` 和 `fsdp2_hsdp_defer_all_reduce=true`，可采用与 VeOmni 相同的“每步 reduce-scatter、窗口末尾 all-reduce”调度；关闭延迟选项则保留原有同步行为。两个选项均不会改变梯度累积次数、梯度裁剪或 optimizer/scheduler 更新边界。同步频率、分组或精度变化可能改变浮点舍入，即使数学上的梯度累积目标相同，也不保证逐位一致。
+
+例如，复用现有缓存，以 4 个 microstep 累积梯度，同时每步同步梯度并显式预取一层：
+
+```shell
+STAGE=train bash examples/minimax_h3/model_training/full/MiniMax-H3-FL2VA-FSDP2.sh \
+  --gradient_accumulation_steps 4 \
+  --fsdp2_sync_each_batch true \
+  --fsdp2_reshard_after_backward true \
+  --fsdp2_reduce_dtype float32 \
+  --fsdp2_forward_prefetch 1 \
+  --fsdp2_backward_prefetch 1
+```
+
+8 个进程下，追加 `--fsdp2_dp_replicate_size 2 --fsdp2_dp_shard_size 4 --fsdp2_hsdp_defer_all_reduce true` 可选择 2×4 HSDP 并采用上述延迟调度。去掉最后一个选项则仍然每步同步两个组。这些选项只在训练阶段传给上述脚本；数据预处理阶段使用独立的单进程配置。
+
 ## MUSA 算子优化
 
 在启动普通 MiniMax-H3 训练之前，可通过两个独立环境变量开启 MUSA 融合算子，默认均关闭：

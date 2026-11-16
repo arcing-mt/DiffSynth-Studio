@@ -14,6 +14,44 @@ pip install -e .
 
 For more information on installation, please refer to [Setup Dependencies](../Pipeline_Usage/Setup.md).
 
+## FSDP2 Training Options
+
+The H3 training script accepts the following `--fsdp2_*` options with an Accelerate FSDP2 launch configuration. Omitted options preserve the current defaults. Boolean values accept `true/false` or `1/0`; omitting a boolean's value means `true`.
+
+|Option|Default behavior|Purpose|
+|-|-|-|
+|`--fsdp2_sync_each_batch`|`false`|Synchronize gradients on every microstep while retaining the optimizer update interval from `--gradient_accumulation_steps`. This avoids keeping full accumulated gradients, at the cost of more communication|
+|`--fsdp2_reshard_after_backward`|`true`|Reshard parameters after each backward. `false` retains parameters between accumulation microsteps to avoid the next forward all-gather, using more memory. The final backward before each optimizer update always reshards|
+|`--fsdp2_param_dtype`|`auto`|Unsharded compute-parameter dtype: `bfloat16`, `float16`, or `float32`. `auto` follows the launcher. An explicit value also selects the Accelerate precision mode and H3 weight-loading/input dtype; FP16 uses gradient scaling and FP32 selects `mixed_precision=no`|
+|`--fsdp2_reduce_dtype`|`auto`|Gradient reduction dtype: `bfloat16`, `float16`, or `float32`. `auto` uses the compute dtype|
+|`--fsdp2_output_dtype`|`none`|FSDP module output dtype: `none`, `bfloat16`, `float16`, or `float32`. `none` leaves outputs unchanged. The policy also applies to the loss returned by the root training module|
+|`--fsdp2_cast_forward_inputs`|`false`|Cast floating-point FSDP inputs to the compute dtype. H3 defaults to false to preserve FP64 positions and FP32 RoPE angles; enabling this changes their precision. Configured independently of output dtype|
+|`--fsdp2_forward_prefetch`|`0`|Number of following DiT blocks to explicitly prefetch; `0` leaves explicit forward prefetch unset|
+|`--fsdp2_backward_prefetch`|`0`|Number of preceding DiT blocks to explicitly prefetch; `0` retains PyTorch's automatic backward prefetch, rather than disabling it|
+|`--fsdp2_dp_replicate_size`|Keep launcher configuration|HSDP replication degree. If this is the only topology option specified, infer the shard degree from world size|
+|`--fsdp2_dp_shard_size`|Keep launcher configuration|FSDP/HSDP shard degree. If this is the only topology option specified, infer the replication degree from world size|
+|`--fsdp2_hsdp_defer_all_reduce`|`false`|Keep reduce-scatter on every microstep and defer replica all-reduce until the optimizer boundary. Requires HSDP and `fsdp2_sync_each_batch=true`; invalid combinations raise an error|
+
+`param_dtype` controls compute parameters, not Accelerate's FP32 parameter-shard/optimizer storage under mixed precision. Full FP32 computation requires an FP32-capable attention backend, for example `DIFFSYNTH_ATTENTION_IMPLEMENTATION=torch`, since FlashAttention supports FP16/BF16 only. Parameter resharding and gradient synchronization are independent. Deeper prefetch can keep more full parameters resident. The replication and shard degrees must multiply to world size; replication greater than 1 also requires sharding greater than 1. By default each HSDP gradient synchronization includes reduce-scatter and replica all-reduce. With deferral enabled, the former runs every microstep and the latter at the optimizer boundary, including a short final accumulation window.
+
+When output and compute dtypes differ, only hidden activations are converted back before the next block or final head; positions and RoPE angles need not be cast. Explicitly selecting a different output dtype still incurs output casts and the necessary activation casts back. H3 blocks using the same precision policy can normally keep `output_dtype=none`. With `reshard_after_backward=false`, state changes only at accumulation-window boundaries, and normal or exceptional training exit restores the default.
+
+Reduction dtype still follows compute dtype by default, and prefetch still uses two independent depth controls. In HSDP, combining `fsdp2_sync_each_batch=true` with `fsdp2_hsdp_defer_all_reduce=true` selects VeOmni's schedule: reduce-scatter every microstep and replica all-reduce at the accumulation boundary. Disabling deferral preserves the original synchronization behavior. Neither option changes accumulation length or gradient-clipping/optimizer/scheduler boundaries. Changing synchronization frequency, grouping, or precision can alter floating-point rounding; an equivalent gradient-accumulation objective does not guarantee bitwise-identical results.
+
+For example, reuse an existing data cache, accumulate four microsteps, synchronize gradients every microstep, and explicitly prefetch one block:
+
+```shell
+STAGE=train bash examples/minimax_h3/model_training/full/MiniMax-H3-FL2VA-FSDP2.sh \
+  --gradient_accumulation_steps 4 \
+  --fsdp2_sync_each_batch true \
+  --fsdp2_reshard_after_backward true \
+  --fsdp2_reduce_dtype float32 \
+  --fsdp2_forward_prefetch 1 \
+  --fsdp2_backward_prefetch 1
+```
+
+With eight processes, append `--fsdp2_dp_replicate_size 2 --fsdp2_dp_shard_size 4 --fsdp2_hsdp_defer_all_reduce true` to select 2×4 HSDP with deferred replica all-reduce. Omit the last option to keep synchronizing both groups every microstep. The shell script passes these options only to training; preprocessing uses a separate single-process configuration.
+
 ## MUSA Kernel Optimization
 
 Set either independent environment switch before launching standard MiniMax-H3 training. Both default to disabled:

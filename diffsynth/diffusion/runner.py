@@ -1,4 +1,5 @@
 import os, json, torch, importlib
+from contextlib import nullcontext
 from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
@@ -89,6 +90,7 @@ def launch_training_task(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: min(1.0, (s + 1) / max(1, warm_up_steps)))
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
 
+    fsdp2_options = getattr(accelerator, "diffsynth_fsdp2_options", None)
     if enable_model_cpu_offload:
         optimizer, dataloader = accelerator.prepare(optimizer, dataloader)
         model.pipe.device = accelerator.device
@@ -98,16 +100,26 @@ def launch_training_task(
         exclude_quantized_params_from_ddp_sync(accelerator, model)
         pipe, computation_dtype = model.pipe, model.pipe.torch_dtype
         model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-        if getattr(accelerator, "is_fsdp2", False) and accelerator.mixed_precision == "bf16":
+        if fsdp2_options is not None:
+            pipe.torch_dtype = fsdp2_options.computation_dtype
+            fsdp2_options.prepare_model(model)
+        elif getattr(accelerator, "is_fsdp2", False) and accelerator.mixed_precision == "bf16":
             # Accelerate upcasts parameter storage through model.to(float32).
             # Pipeline input precision must remain independent of that storage.
             pipe.torch_dtype = computation_dtype
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
-    with TrainingProfiler(model_logger.output_path, accelerator.device, accelerator.process_index) as profiler:
+    with (
+        TrainingProfiler(model_logger.output_path, accelerator.device, accelerator.process_index) as profiler,
+        fsdp2_options.training(model) if fsdp2_options is not None else nullcontext(),
+    ):
         for epoch_id in range(num_epochs):
             for data in profiler.iter_dataloader(tqdm(dataloader)):
-                with profile_scope("diffsynth/train_step"), accelerator.accumulate(model):
+                with (
+                    profile_scope("diffsynth/train_step"),
+                    accelerator.accumulate(model),
+                    fsdp2_options.microstep(accelerator, model) if fsdp2_options is not None else nullcontext(),
+                ):
                     with profile_scope("diffsynth/forward"):
                         if dataset.load_from_cache:
                             loss = model({}, inputs=data)

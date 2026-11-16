@@ -2,6 +2,7 @@ import torch, os, argparse, accelerate
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.profiler import profile_scope
 from diffsynth.core.musa_patch import apply_minimax_h3_musa_patch
+from diffsynth.diffusion.fsdp2 import add_fsdp2_training_options, fsdp2_accelerator_kwargs, configure_fsdp2_training
 from diffsynth.core.data.operators import LoadAudioWithTorchaudio, ToAbsolutePath
 from diffsynth.utils.data.minimax_h3 import MiniMaxH3ReferenceLoader
 from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3Pipeline, ModelConfig
@@ -34,6 +35,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         audio_loss_weight=1.0,
         device="cpu",
         task="sft",
+        torch_dtype=torch.bfloat16,
     ):
         super().__init__()
         if training_cfg_scale < 1.0:
@@ -45,7 +47,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         pipe_kwargs = {}
         if processor_path is not None:
             pipe_kwargs["processor_config"] = self.parse_path_or_model_id(processor_path)
-        self.pipe = MiniMaxH3Pipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, **pipe_kwargs)
+        self.pipe = MiniMaxH3Pipeline.from_pretrained(torch_dtype=torch_dtype, device=device, model_configs=model_configs, **pipe_kwargs)
         apply_minimax_h3_musa_patch(self.pipe.dit)
         self.pipe = self.load_training_template_model(self.pipe, template_model_id_or_path, use_gradient_checkpointing, use_gradient_checkpointing_offload)
         self.pipe = self.split_pipeline_units(
@@ -155,6 +157,7 @@ def minimax_h3_parser():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser = add_general_config(parser)
     parser = add_video_size_config(parser)
+    parser = add_fsdp2_training_options(parser)
     parser.add_argument("--processor_path", type=str, default=None, help="Path or `model_id:pattern` of the Qwen3-VL processor.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--silent_on_missing_audio", default=False, action="store_true", help="Whether to use silent audio as a fallback when no audio track is present in the video data.")
@@ -168,18 +171,9 @@ def minimax_h3_accelerator(args):
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
+        **fsdp2_accelerator_kwargs(args),
     )
-    if getattr(accelerator, "is_fsdp2", False) and accelerator.mixed_precision == "bf16":
-        from torch.distributed.fsdp import MixedPrecisionPolicy
-
-        # H3 prepares its own BF16 activations. Preserve FP64 position IDs,
-        # FP32 RoPE angles passed to blocks, and the FP32 training loss.
-        accelerator.state.fsdp_plugin.mixed_precision_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            output_dtype=None,
-            cast_forward_inputs=False,
-        )
+    configure_fsdp2_training(accelerator, args)
     return accelerator
 
 
@@ -230,6 +224,7 @@ if __name__ == "__main__":
         }
     )
     model = MiniMaxH3TrainingModule(
+        torch_dtype=accelerator.diffsynth_fsdp2_options.computation_dtype if getattr(accelerator, "is_fsdp2", False) else torch.bfloat16,
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         processor_path=args.processor_path,
