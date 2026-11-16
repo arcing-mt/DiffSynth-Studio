@@ -4,6 +4,7 @@ from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 from diffsynth.core import OffloadTrainingManager
+from diffsynth.core.profiler import TrainingProfiler, profile_scope
 
 
 def get_optimizer_class(customized_optimizer=None):
@@ -103,29 +104,43 @@ def launch_training_task(
             pipe.torch_dtype = computation_dtype
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
-    for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
-            with accelerator.accumulate(model):
-                if dataset.load_from_cache:
-                    loss = model({}, inputs=data)
-                else:
-                    loss = model(data)
-                accelerator.backward(loss)
-                if getattr(accelerator, "is_fsdp2", False) and accelerator.sync_gradients:
-                    max_grad_norm = getattr(args, "max_grad_norm", 0.0)
-                    if max_grad_norm > 0:
-                        accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
-                if enable_model_cpu_offload:
-                    offload_manager.after_backward()
-                optimizer.step()
-                if accelerator.sync_gradients and not getattr(optimizer, "step_was_skipped", False):
-                    scheduler.step()
-                optimizer.zero_grad()
-                model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
-        if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
+    with TrainingProfiler(model_logger.output_path, accelerator.device, accelerator.process_index) as profiler:
+        for epoch_id in range(num_epochs):
+            for data in profiler.iter_dataloader(tqdm(dataloader)):
+                with profile_scope("diffsynth/train_step"), accelerator.accumulate(model):
+                    with profile_scope("diffsynth/forward"):
+                        if dataset.load_from_cache:
+                            loss = model({}, inputs=data)
+                        else:
+                            loss = model(data)
+                    # DeepSpeed may also update the optimizer inside backward().
+                    with profile_scope("diffsynth/backward"):
+                        accelerator.backward(loss)
+                    if getattr(accelerator, "is_fsdp2", False) and accelerator.sync_gradients:
+                        max_grad_norm = getattr(args, "max_grad_norm", 0.0)
+                        if max_grad_norm > 0:
+                            with profile_scope("diffsynth/clip_grad_norm"):
+                                accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    if enable_model_cpu_offload:
+                        with profile_scope("diffsynth/offload_after_backward"):
+                            offload_manager.after_backward()
+                    with profile_scope("diffsynth/optimizer_step"):
+                        optimizer.step()
+                    if accelerator.sync_gradients and not getattr(optimizer, "step_was_skipped", False):
+                        with profile_scope("diffsynth/lr_scheduler_step"):
+                            scheduler.step()
+                    with profile_scope("diffsynth/zero_grad"):
+                        optimizer.zero_grad()
+                    with profile_scope("diffsynth/log_and_checkpoint"):
+                        model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                # Count batches, including gradient-accumulation microsteps.
+                profiler.step()
+            if save_steps is None:
+                with profile_scope("diffsynth/epoch_checkpoint"):
+                    model_logger.on_epoch_end(accelerator, model, epoch_id)
 
-    model_logger.on_training_end(accelerator, model, save_steps)
+        with profile_scope("diffsynth/training_end"):
+            model_logger.on_training_end(accelerator, model, save_steps)
 
 
 def launch_data_process_task(
@@ -137,6 +152,9 @@ def launch_data_process_task(
     args = None,
     **kwargs,
 ):
+    enable_model_cpu_offload = False
+    enable_optimizer_cpu_offload = False
+    cpu_offload_split_threshold = None
     if args is not None:
         num_workers = args.dataset_num_workers
         enable_model_cpu_offload = args.enable_model_cpu_offload
@@ -153,16 +171,21 @@ def launch_data_process_task(
         exclude_quantized_params_from_ddp_sync(accelerator, model)
         model, dataloader = accelerator.prepare(model, dataloader)
     
-    for data_id, data in enumerate(tqdm(dataloader)):
-        with accelerator.accumulate(model):
-            with torch.no_grad():
-                folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
-                os.makedirs(folder, exist_ok=True)
-                save_path = os.path.join(model_logger.output_path, str(accelerator.process_index), f"{data_id}.pth")
-                data = model(data)
-                torch.save(data, save_path)
-                if enable_model_cpu_offload:
-                    offload_manager.after_backward()
+    with TrainingProfiler(model_logger.output_path, accelerator.device, accelerator.process_index, task="data_process") as profiler:
+        for data_id, data in enumerate(profiler.iter_dataloader(tqdm(dataloader))):
+            with profile_scope("diffsynth/data_process_step"), accelerator.accumulate(model):
+                with torch.no_grad():
+                    folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
+                    os.makedirs(folder, exist_ok=True)
+                    save_path = os.path.join(model_logger.output_path, str(accelerator.process_index), f"{data_id}.pth")
+                    with profile_scope("diffsynth/forward"):
+                        data = model(data)
+                    with profile_scope("diffsynth/save_cache"):
+                        torch.save(data, save_path)
+                    if enable_model_cpu_offload:
+                        with profile_scope("diffsynth/offload_after_backward"):
+                            offload_manager.after_backward()
+            profiler.step()
 
 def initialize_deepspeed_gradient_checkpointing(accelerator: Accelerator):
     if getattr(accelerator.state, "deepspeed_plugin", None) is not None:

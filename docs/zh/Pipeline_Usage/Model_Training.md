@@ -246,6 +246,35 @@ accelerate launch --config_file examples/qwen_image/model_training/full/accelera
   --find_unused_parameters
 ```
 
+## 性能分析与 trace 输出
+
+在原有训练命令前设置 `PROFILE_ENABLE=1` 即可开启 profiler，例如：
+
+```shell
+PROFILE_ENABLE=1 bash examples/minimax_h3/model_training/full/MiniMax-H3-FL2VA.sh
+```
+
+所有使用 `launch_training_task` / `launch_data_process_task` 的脚本都支持这个开关，默认关闭。实现参考 VeOmni：先等待、预热，再采集一个有限窗口；窗口结束后停止 profiler，训练继续执行。默认仅在全局 rank 0 记录第 3、4、5 个迭代，将压缩的 Chrome trace 写入 `<output_path>/profiler/`，文件名包含任务、rank、主机名、进程号和时间戳，避免多进程或重复运行覆盖。可将 `.pt.trace.json.gz` 解压后导入 Perfetto 或 `chrome://tracing`。
+
+以下环境变量均为可选配置，布尔值支持 `1/0`、`true/false`、`yes/no`、`on/off`：
+
+|环境变量|默认值|含义|
+|-|-|-|
+|`PROFILE_ENABLE`|`0`|启用性能采样|
+|`PROFILE_START_STEP`|`3`|开始采集的迭代编号，从 1 开始|
+|`PROFILE_END_STEP`|`6`|结束编号，不包含该迭代；必须大于开始编号|
+|`PROFILE_TRACE_DIR`|`<output_path>/profiler`|trace 输出目录|
+|`PROFILE_RANK0_ONLY`|`true`|设为 `false` 时每个 rank 分别输出 trace|
+|`PROFILE_RECORD_SHAPES`|`true`|记录 tensor 形状|
+|`PROFILE_MEMORY`|`false`|在 trace 中记录内存分配事件，不额外导出内存快照|
+|`PROFILE_STACK`|`true`|记录调用栈|
+
+编号按当前任务中的 dataloader batch（microstep）递增，跨 epoch 连续计数；使用梯度累积时，并非 optimizer 更新次数。开始编号大于 1 时，采集前一个迭代用于预热。训练提前结束或抛出 Python 异常时，会关闭 profiler 并保存已经进入采集窗口的部分；若尚未进入窗口则没有 trace。短任务可设置 `PROFILE_START_STEP=1 PROFILE_END_STEP=2` 采集首个迭代，此时无预热。
+
+trace 中的 `diffsynth/*` 标记覆盖主进程取数据、前向、反向、FSDP2 梯度裁剪、CPU offload、optimizer、scheduler、清零梯度、日志及 checkpoint，以及数据预处理的缓存保存。`diffsynth/unit/<类名>` 进一步区分 pipeline 中的文本编码、VAE 等单元；MiniMax-H3 还标记了输入准备、设备搬运和模型/损失计算。DataLoader worker 内部的处理不会被主进程 profiler 直接展开，需要分析这部分时可使用 `--dataset_num_workers 0`。DeepSpeed 可能在 `accelerator.backward()` 内执行 optimizer 更新，应结合 kernel 事件读取该范围。
+
+根据实际训练设备选择 CPU、CUDA、MUSA（包括 `PrivateUse1` 版本）或 NPU profiler。NPU 使用 `torch_npu` 的原生 trace 输出目录。若当前 PyTorch 未提供相应设备的 profiler activity，会提示并仅记录 CPU 事件。采样有额外开销，性能对比时应保持采样配置一致；关闭 `PROFILE_ENABLE` 后不会创建 profiler 或写入 trace。
+
 ## 训练注意事项
 
 * 数据集的元数据除 `csv` 格式外，还支持 `json`、`jsonl` 格式，关于如何选择最佳的元数据格式，请参考[](../API_Reference/core/data.md#元数据)

@@ -245,6 +245,35 @@ accelerate launch --config_file examples/qwen_image/model_training/full/accelera
   --find_unused_parameters
 ```
 
+## Profiling and Trace Output
+
+Prefix an existing training command with `PROFILE_ENABLE=1` to enable profiling:
+
+```shell
+PROFILE_ENABLE=1 bash examples/minimax_h3/model_training/full/MiniMax-H3-FL2VA.sh
+```
+
+This switch works with all scripts using `launch_training_task` or `launch_data_process_task` and is disabled by default. Following VeOmni, the profiler waits, warms up, records one bounded window, and stops while training continues. By default, global rank 0 records iterations 3, 4, and 5 to `<output_path>/profiler/`. Compressed Chrome trace filenames include the task, rank, hostname, PID, and timestamp to avoid collisions. Decompress `.pt.trace.json.gz` files and open them in Perfetto or `chrome://tracing`.
+
+All settings below are optional. Boolean values accept `1/0`, `true/false`, `yes/no`, or `on/off`.
+
+|Environment variable|Default|Meaning|
+|-|-|-|
+|`PROFILE_ENABLE`|`0`|Enable profiling|
+|`PROFILE_START_STEP`|`3`|First recorded iteration, numbered from 1|
+|`PROFILE_END_STEP`|`6`|Exclusive end; must exceed the start|
+|`PROFILE_TRACE_DIR`|`<output_path>/profiler`|Trace output directory|
+|`PROFILE_RANK0_ONLY`|`true`|Set to `false` to write a trace for every rank|
+|`PROFILE_RECORD_SHAPES`|`true`|Record tensor shapes|
+|`PROFILE_MEMORY`|`false`|Record allocation events in the trace; no separate memory snapshot|
+|`PROFILE_STACK`|`true`|Record call stacks|
+
+Steps count dataloader batches (microsteps) within each task, continuing across epochs. With gradient accumulation, these differ from optimizer updates. When the start exceeds 1, the preceding iteration is used for warmup. Early completion or a Python exception stops the profiler and flushes any partially recorded window; exiting before the recording window produces no trace. For a short run, set `PROFILE_START_STEP=1 PROFILE_END_STEP=2` to capture the first iteration without warmup.
+
+The `diffsynth/*` ranges identify data loading in the main process, forward, backward, FSDP2 gradient clipping, CPU offload, optimizer, scheduler, zeroing gradients, logging/checkpoints, and preprocessing cache writes. `diffsynth/unit/<class name>` separates pipeline units such as text encoding and VAE processing. MiniMax-H3 also marks input preparation, device transfer, and model/loss evaluation. DataLoader worker internals are not traced by the main process; use `--dataset_num_workers 0` to inspect them. DeepSpeed can perform optimizer updates inside `accelerator.backward()`, so interpret that range alongside kernel events.
+
+The profiler follows the actual training device: CPU, CUDA, MUSA (including PrivateUse1 builds), or NPU. NPU uses the native `torch_npu` trace output directory. If the installed PyTorch lacks the device activity, a warning is emitted and only CPU events are recorded. Profiling adds overhead; use matching settings for comparisons. Disabling `PROFILE_ENABLE` avoids profiler creation and trace writes.
+
 ## Training Considerations
 
 * In addition to the `csv` format, dataset metadata also supports `json` and `jsonl` formats. For how to choose the best metadata format, please refer to [../API_Reference/core/data.md#metadata](../API_Reference/core/data.md#metadata)

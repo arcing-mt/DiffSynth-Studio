@@ -9,6 +9,7 @@ from ..utils.lora import GeneralLoRALoader
 from ..models.model_loader import ModelPool
 from ..utils.controlnet import ControlNetInput
 from ..core.device import get_device_name, IS_NPU_AVAILABLE
+from ..core.profiler import profile_scope
 from .template import load_template_model, load_template_data_processor
 
 
@@ -514,6 +515,10 @@ class PipelineUnitRunner:
         pass
 
     def __call__(self, unit: PipelineUnit, pipe: BasePipeline, inputs_shared: dict, inputs_posi: dict, inputs_nega: dict) -> tuple[dict, dict]:
+        with profile_scope(f"diffsynth/unit/{type(unit).__name__}"):
+            return self.run(unit, pipe, inputs_shared, inputs_posi, inputs_nega)
+
+    def run(self, unit: PipelineUnit, pipe: BasePipeline, inputs_shared: dict, inputs_posi: dict, inputs_nega: dict) -> tuple[dict, dict]:
         if unit.take_over:
             # Let the pipeline unit take over this function.
             inputs_shared, inputs_posi, inputs_nega = unit.process(pipe, inputs_shared=inputs_shared, inputs_posi=inputs_posi, inputs_nega=inputs_nega)

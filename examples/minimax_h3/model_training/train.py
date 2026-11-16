@@ -1,5 +1,6 @@
 import torch, os, argparse, accelerate
 from diffsynth.core import UnifiedDataset
+from diffsynth.core.profiler import profile_scope
 from diffsynth.core.data.operators import LoadAudioWithTorchaudio, ToAbsolutePath
 from diffsynth.utils.data.minimax_h3 import MiniMaxH3ReferenceLoader
 from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3Pipeline, ModelConfig
@@ -137,11 +138,14 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         return inputs_shared, inputs_posi, inputs_nega
 
     def forward(self, data, inputs=None):
-        if inputs is None: inputs = self.get_pipeline_inputs(data)
-        inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
+        with profile_scope("diffsynth/prepare_inputs"):
+            if inputs is None: inputs = self.get_pipeline_inputs(data)
+        with profile_scope("diffsynth/transfer_to_device"):
+            inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
-        loss = self.task_to_loss[self.task](self.pipe, *inputs)
+        with profile_scope("diffsynth/model_and_loss"):
+            loss = self.task_to_loss[self.task](self.pipe, *inputs)
         return loss
 
 
