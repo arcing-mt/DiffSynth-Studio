@@ -88,7 +88,7 @@ def launch_training_task(
     optimizer_class = get_optimizer_class(customized_optimizer)
     optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: min(1.0, (s + 1) / max(1, warm_up_steps)))
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader = torch.utils.data.DataLoader(dataset, shuffle=getattr(dataset, "shuffle", True), collate_fn=lambda x: x[0], num_workers=num_workers)
 
     fsdp2_options = getattr(accelerator, "diffsynth_fsdp2_options", None)
     if enable_model_cpu_offload:

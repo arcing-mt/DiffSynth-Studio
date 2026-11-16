@@ -196,7 +196,8 @@ class MiniMaxH3AdalnProj(nn.Module):
 
     def forward(self, t_emb):
         x = nn.functional.silu(t_emb)
-        x = self.linear(x)
+        # The optional FP32 time embedder feeds BF16 transformer blocks.
+        x = self.linear(x.to(self.linear.weight.dtype))
         m = x.shape[0]
         x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
         return tuple(x.chunk(self.expand_ratio, dim=-1))

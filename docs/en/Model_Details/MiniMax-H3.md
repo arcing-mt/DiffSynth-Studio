@@ -14,6 +14,23 @@ pip install -e .
 
 For more information on installation, please refer to [Setup Dependencies](../Pipeline_Usage/Setup.md).
 
+## Synthetic Inputs and Training Precision
+
+`--synthetic_inputs` supplies fixed random video/audio latents and text embeddings for `sft:train`, without a dataset, processor, or reference media. It requires `--dataset_num_workers 0` and `--training_cfg_scale 1`. Samples have separate seeds per rank/accumulation microstep and are reused across updates. `--dataset_repeat` is the global sample count.
+
+The reproduction zip's geometry is preserved: video tokens are `((num_frames-1)//4+1)*(height//32)*(width//32)`, text has 256 tokens, and audio has `max(1, round(num_frames/24*40)*2)` tokens. For 720×1280 at 24fps for 10 seconds, use `--height 720 --width 1280 --num_frames 240`: 52,800 video + 256 text + 800 audio = 53,856 tokens. The original formula floors height 720 to 22 spatial cells. These are synthetic shapes, not actual VAE encodings, so the VAE's `17n+5` frame constraint does not apply.
+
+|Environment variable|Repository default|Behavior|
+|-|-|-|
+|`MINIMAX_H3_ZERO_TARGET_LOSS`|`1`|Sum the FP32 mean squares of video and audio predictions, without scheduler or audio-loss weights. Synthetic inputs use model time 0.5 directly; real inputs retain their original noising. Set to `0` to restore flow-matching targets, noising, and weighting|
+|`MINIMAX_H3_FP32_MODULES`|`0`|At the training entry point, run `video_patch_proj`, `audio_patch_proj`, `time_embedder`, `final_layer.video_out`, `final_layer.audio_out`, and `rope` in FP32 with autocast disabled. These map to the zip's `proj_in`, `audio_proj_in`, `time_embedder`, `proj_out`, `audio_proj_out`, and `rope`; requires an ordinary, unquantized H3 DiT|
+
+The FP32 option reloads only these modules' original weights to avoid BF16 rounding. FSDP2 shards them with separate FP32 policies, preserving the configured mesh, reshard/offload settings, and reduction dtype. Other modules retain their original compute precision. Time embeddings are converted to each AdaLN linear layer's parameter dtype before that layer. FSDP1, DeepSpeed, and `fsdp_cpu_ram_efficient_loading=true` are currently unsupported with this option.
+
+`start_ref2va_multinode.sh` explicitly enables both switches, uses FP32 reduction, a fixed learning rate of `1e-5`, `warm_up_steps=0`, and `max_grad_norm=0`. Microbatch 1, accumulation 2, four nodes/32 devices, global batch 64, optimizer, compilation, fused kernels, profiler, and saving settings otherwise remain unchanged.
+
+Set `MODEL_DIR` and `MASTER_ADDR` through environment variables before launching. `REPO_DIR` defaults to the script directory, `PYTHON_BIN` to the current environment's `python`, and `OUTPUT_DIR` to `$REPO_DIR/runs/ref2va-fsdp2`. All paths can be overridden; use absolute paths for path settings. The script contains generic examples, without deployment-specific paths or addresses.
+
 ## FSDP2 Training Options
 
 The H3 training script accepts the following `--fsdp2_*` options with an Accelerate FSDP2 launch configuration. Omitted options preserve the current defaults. Boolean values accept `true/false` or `1/0`; omitting a boolean's value means `true`.
@@ -277,8 +294,8 @@ Models in the MiniMax-H3 series are trained uniformly via [`examples/minimax_h3/
     * `--processor_path`: Path of the Qwen3-VL processor, supports the `model_id:origin_file_pattern` form, used to tokenize the prompt.
     * `--initialize_model_on_cpu`: Whether to initialize models on CPU.
     * `--silent_on_missing_audio`: Whether to use silent audio as a fallback when no audio track is present in the video data.
-    * `--training_cfg_scale`: Inverse-CFG scale for preserving MiniMax-H3 guidance distillation during fine-tuning. Values greater than 1 enable a no-grad unconditional branch; 1 keeps the standard flow-matching loss.
-    * `--audio_loss_weight`: Weight of the audio term in the MiniMax-H3 loss. 1 keeps video and audio equally weighted; 0 trains on the video term only while the audio stream is still noised and forwarded.
+    * `--training_cfg_scale`: Inverse-CFG scale for preserving MiniMax-H3 guidance distillation during fine-tuning. Values greater than 1 enable a no-grad unconditional branch. Set `MINIMAX_H3_ZERO_TARGET_LOSS=0` for flow-matching training.
+    * `--audio_loss_weight`: Audio weight for flow-matching loss, used only with `MINIMAX_H3_ZERO_TARGET_LOSS=0`. A value of 0 excludes audio loss while still noising and forwarding the audio stream.
 
 We provide an example dataset for testing, which can be downloaded with the following command:
 

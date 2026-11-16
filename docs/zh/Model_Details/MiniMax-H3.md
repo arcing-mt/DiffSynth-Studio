@@ -14,6 +14,23 @@ pip install -e .
 
 更多关于安装的信息，请参考[安装依赖](../Pipeline_Usage/Setup.md)。
 
+## 合成输入与训练精度
+
+`--synthetic_inputs` 为 `sft:train` 生成固定随机 latent 和文本 embedding，不读取数据集、processor 或参考图像/音频；要求 `--dataset_num_workers 0`、`--training_cfg_scale 1`。每个 rank 的各累积步使用独立种子，样本在后续更新中复用，`--dataset_repeat` 表示全局样本总次数。
+
+形状沿用复测 zip：视频 token 为 `((num_frames-1)//4+1)*(height//32)*(width//32)`，文本 256 token，音频 `max(1, round(num_frames/24*40)*2)` token。720×1280、24fps、10 秒设置为 `--height 720 --width 1280 --num_frames 240`，共 53,856 token（视频 52,800＋文本 256＋音频 800）。720 按原生成规则向下取整为 22 个空间格；这不是实际 VAE 编码后的形状，合成输入不受 VAE 的 `17n+5` 帧数约束。
+
+|环境变量|仓库默认|作用|
+|-|-|-|
+|`MINIMAX_H3_ZERO_TARGET_LOSS`|`1`|H3 训练使用视频、音频输出的 FP32 平方均值之和，不乘 scheduler 权重或 `audio_loss_weight`。合成输入直接在模型时间 0.5 计算；真实输入保留原有加噪流程。设为 `0` 恢复原有 flow-matching loss，包括加噪、目标及权重|
+|`MINIMAX_H3_FP32_MODULES`|`0`|仅训练入口为普通、非量化 H3 DiT 的 `video_patch_proj`、`audio_patch_proj`、`time_embedder`、`final_layer.video_out`、`final_layer.audio_out`、`rope` 启用 FP32 计算并关闭这些模块的 autocast；对应 zip 的 `proj_in`、`audio_proj_in`、`time_embedder`、`proj_out`、`audio_proj_out`、`rope`|
+
+FP32 开关开启时仅重新读取上述模块的原始权重，避免先经 BF16 舍入。FSDP2 为这些模块单独设置 FP32 参数策略，沿用配置的 mesh、reshard、offload 和归约精度；其余模块仍使用原计算精度。时间 embedding 在各 AdaLN 线性层前转换到该层参数精度。当前不支持 FSDP1、DeepSpeed 或 `fsdp_cpu_ram_efficient_loading=true` 与此开关组合。
+
+`start_ref2va_multinode.sh` 显式开启两个开关，采用 FP32 归约、固定 `1e-5` 学习率、`warm_up_steps=0` 和 `max_grad_norm=0`。仍为 microbatch 1、累积 2、4 机 32 卡、global batch 64；优化器、compile、融合算子、profiler 和保存配置保持原设置。
+
+启动前通过环境变量指定 `MODEL_DIR` 和 `MASTER_ADDR`。`REPO_DIR` 默认脚本所在目录，`PYTHON_BIN` 默认当前环境的 `python`，`OUTPUT_DIR` 默认 `$REPO_DIR/runs/ref2va-fsdp2`；这些路径均可覆盖，路径配置请使用绝对路径。脚本仅提供通用示例，不包含部署机器的实际路径或地址。
+
 ## FSDP2 训练选项
 
 H3 训练脚本支持以下 `--fsdp2_*` 选项，需使用 FSDP2 的 Accelerate 启动配置。未指定时保留当前默认行为；布尔值可写 `true/false` 或 `1/0`，也可省略值表示 `true`。
@@ -277,8 +294,8 @@ MiniMax-H3 系列模型统一通过 [`examples/minimax_h3/model_training/train.p
     * `--processor_path`: Qwen3-VL processor 的路径，支持 `model_id:origin_file_pattern` 形式，用于对 prompt 进行 tokenize。
     * `--initialize_model_on_cpu`: 是否在 CPU 上初始化模型。
     * `--silent_on_missing_audio`: 视频数据不含音轨时，是否以静音音频作为兜底。
-    * `--training_cfg_scale`: 微调时用于保留 MiniMax-H3 指导蒸馏的逆 CFG 系数。大于 1 时启用一路无梯度的无条件分支，等于 1 时保持标准 flow matching 损失。
-    * `--audio_loss_weight`: MiniMax-H3 损失中音频项的权重。为 1 时视频与音频等权重，为 0 时只用视频项训练，音频流仍会加噪并送入模型。
+    * `--training_cfg_scale`: 微调时用于保留 MiniMax-H3 指导蒸馏的逆 CFG 系数。大于 1 时启用一路无梯度的无条件分支；使用 flow-matching 训练时需设置 `MINIMAX_H3_ZERO_TARGET_LOSS=0`。
+    * `--audio_loss_weight`: flow-matching 损失中音频项的权重，仅 `MINIMAX_H3_ZERO_TARGET_LOSS=0` 时生效。为 0 时只用视频项训练，音频流仍会加噪并送入模型。
 
 我们构建了一个样例数据集，以方便您进行测试，通过以下命令可以下载这个数据集：
 

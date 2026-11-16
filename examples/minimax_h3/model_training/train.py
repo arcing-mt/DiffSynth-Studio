@@ -3,6 +3,7 @@ from diffsynth.core import UnifiedDataset
 from diffsynth.core.profiler import profile_scope
 from diffsynth.core.musa_patch import apply_minimax_h3_musa_patch
 from diffsynth.diffusion.fsdp2 import add_fsdp2_training_options, fsdp2_accelerator_kwargs, configure_fsdp2_training
+from diffsynth.diffusion.minimax_h3_training import MiniMaxH3SyntheticDataset, configure_h3_fp32_modules, shard_h3_fp32_modules
 from diffsynth.core.data.operators import LoadAudioWithTorchaudio, ToAbsolutePath
 from diffsynth.utils.data.minimax_h3 import MiniMaxH3ReferenceLoader
 from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3Pipeline, ModelConfig
@@ -36,18 +37,23 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         device="cpu",
         task="sft",
         torch_dtype=torch.bfloat16,
+        synthetic_inputs=False,
     ):
         super().__init__()
         if training_cfg_scale < 1.0:
             raise ValueError("training_cfg_scale must be at least 1.0")
         self.training_cfg_scale = training_cfg_scale
         self.audio_loss_weight = audio_loss_weight
+        self.synthetic_inputs = synthetic_inputs
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, quant_options=quant_options, device=device)
         pipe_kwargs = {}
-        if processor_path is not None:
+        if synthetic_inputs:
+            pipe_kwargs["processor_config"] = None
+        elif processor_path is not None:
             pipe_kwargs["processor_config"] = self.parse_path_or_model_id(processor_path)
         self.pipe = MiniMaxH3Pipeline.from_pretrained(torch_dtype=torch_dtype, device=device, model_configs=model_configs, **pipe_kwargs)
+        configure_h3_fp32_modules(self.pipe.dit, model_configs)
         apply_minimax_h3_musa_patch(self.pipe.dit)
         self.pipe = self.load_training_template_model(self.pipe, template_model_id_or_path, use_gradient_checkpointing, use_gradient_checkpointing_offload)
         self.pipe = self.split_pipeline_units(
@@ -145,8 +151,8 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         with profile_scope("diffsynth/prepare_inputs"):
             if inputs is None: inputs = self.get_pipeline_inputs(data)
         with profile_scope("diffsynth/transfer_to_device"):
-            inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
-        for unit in self.pipe.units:
+            inputs = self.transfer_data_to_device(inputs, self.pipe.device, None if self.synthetic_inputs else self.pipe.torch_dtype)
+        for unit in (() if self.synthetic_inputs else self.pipe.units):
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         with profile_scope("diffsynth/model_and_loss"):
             loss = self.task_to_loss[self.task](self.pipe, *inputs)
@@ -158,11 +164,14 @@ def minimax_h3_parser():
     parser = add_general_config(parser)
     parser = add_video_size_config(parser)
     parser = add_fsdp2_training_options(parser)
+    # Synthetic inputs do not need a dataset directory; validate real data below.
+    parser._option_string_actions["--dataset_base_path"].required = False
+    parser.add_argument("--synthetic_inputs", action="store_true", help="Use fixed random video/audio latents and 256 text embeddings, at 24fps, without VAE/processor/reference data. dataset_repeat is the total sample count; requires dataset_num_workers=0.")
     parser.add_argument("--processor_path", type=str, default=None, help="Path or `model_id:pattern` of the Qwen3-VL processor.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--silent_on_missing_audio", default=False, action="store_true", help="Whether to use silent audio as a fallback when no audio track is present in the video data.")
-    parser.add_argument("--training_cfg_scale", type=float, default=1.0, help="Inverse-CFG scale for preserving MiniMax-H3 guidance distillation during fine-tuning. Values greater than 1 enable a no-grad unconditional branch; 1 keeps the standard flow-matching loss.")
-    parser.add_argument("--audio_loss_weight", type=float, default=1.0, help="Weight of the audio term in the MiniMax-H3 loss. 1 keeps video and audio equally weighted; 0 trains on the video term only while the audio stream is still noised and forwarded.")
+    parser.add_argument("--training_cfg_scale", type=float, default=1.0, help="Inverse-CFG scale for preserving MiniMax-H3 guidance distillation during fine-tuning. Values greater than 1 enable a no-grad unconditional branch. Set MINIMAX_H3_ZERO_TARGET_LOSS=0 for flow-matching training.")
+    parser.add_argument("--audio_loss_weight", type=float, default=1.0, help="Audio weight for flow-matching loss (MINIMAX_H3_ZERO_TARGET_LOSS=0). Ignored by the default unweighted zero-target loss. 0 excludes the audio loss while still forwarding the audio stream.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping threshold for FSDP2 training. Set to 0 to disable. DeepSpeed uses its own configuration.")
     parser.add_argument("--disable_model_save", default=False, action="store_true", help="Disable all model checkpoint saves, including epoch/end-of-training saves and state-dict gathering. Configured logs/profiles and preprocessing caches are unaffected.")
     return parser
@@ -178,15 +187,7 @@ def minimax_h3_accelerator(args):
     return accelerator
 
 
-if __name__ == "__main__":
-    parser = minimax_h3_parser()
-    args = parser.parse_args()
-    if args.num_frames % MINIMAX_H3_TIME_DIVISION_FACTOR != MINIMAX_H3_TIME_DIVISION_REMAINDER:
-        raise ValueError(
-            f"--num_frames must be {MINIMAX_H3_TIME_DIVISION_FACTOR}n+{MINIMAX_H3_TIME_DIVISION_REMAINDER} "
-            f"(e.g. 39, 56, 124) so it lands on the video VAE's temporal grouping, got {args.num_frames}."
-        )
-    accelerator = minimax_h3_accelerator(args)
+def make_dataset(args):
     video_processor = UnifiedDataset.default_video_operator(
         base_path=args.dataset_base_path,
         max_pixels=args.max_pixels,
@@ -200,7 +201,7 @@ if __name__ == "__main__":
         frame_rate=MINIMAX_H3_FRAME_RATE,
         fix_frame_rate=True,
     )
-    dataset = UnifiedDataset(
+    return UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
@@ -224,8 +225,39 @@ if __name__ == "__main__":
             ),
         }
     )
+
+
+if __name__ == "__main__":
+    parser = minimax_h3_parser()
+    args = parser.parse_args()
+    if args.synthetic_inputs:
+        if args.task != "sft:train" or args.dataset_num_workers != 0 or args.training_cfg_scale != 1.0:
+            parser.error("--synthetic_inputs requires --task sft:train, --dataset_num_workers 0 and --training_cfg_scale 1.")
+    elif not args.dataset_base_path:
+        parser.error("--dataset_base_path is required without --synthetic_inputs.")
+    if not args.synthetic_inputs and args.num_frames % MINIMAX_H3_TIME_DIVISION_FACTOR != MINIMAX_H3_TIME_DIVISION_REMAINDER:
+        raise ValueError(
+            f"--num_frames must be {MINIMAX_H3_TIME_DIVISION_FACTOR}n+{MINIMAX_H3_TIME_DIVISION_REMAINDER} "
+            f"(e.g. 39, 56, 124) so it lands on the video VAE's temporal grouping, got {args.num_frames}."
+        )
+    accelerator = minimax_h3_accelerator(args)
+    if args.synthetic_inputs:
+        dataset = MiniMaxH3SyntheticDataset(
+            args.height, args.width, args.num_frames, args.dataset_repeat,
+            world_size=accelerator.num_processes, accumulation=args.gradient_accumulation_steps,
+            device=accelerator.device,
+            dtype=accelerator.diffsynth_fsdp2_options.computation_dtype if getattr(accelerator, "is_fsdp2", False) else torch.bfloat16,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+        )
+        if accelerator.is_main_process:
+            print(f"Synthetic H3: {args.width}x{args.height}, {args.num_frames} frames @24fps; "
+                  f"video={dataset.video_tokens}, text={dataset.text_tokens}, audio={dataset.audio_tokens}, total={dataset.seq_len} tokens.")
+    else:
+        dataset = make_dataset(args)
     model = MiniMaxH3TrainingModule(
         torch_dtype=accelerator.diffsynth_fsdp2_options.computation_dtype if getattr(accelerator, "is_fsdp2", False) else torch.bfloat16,
+        synthetic_inputs=args.synthetic_inputs,
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         processor_path=args.processor_path,
@@ -251,6 +283,7 @@ if __name__ == "__main__":
         task=args.task,
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
     )
+    shard_h3_fp32_modules(model, accelerator)
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
