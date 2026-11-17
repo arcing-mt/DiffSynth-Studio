@@ -84,13 +84,13 @@ export GLOO_SOCKET_IFNAME="${NET_IFACE:-bond0}"
 export MCCL_DEBUG=WARN
 export TORCH_DISTRIBUTED_DEBUG=OFF
 
-# 关闭该分支的额外融合算子开关；不启用 torch.compile。
-export MINIMAX_H3_MUSA_FUSED_ROPE=0
-export MINIMAX_H3_MUSA_FUSED_SWIGLU=0
+# 融合算子默认关闭，可通过环境变量启用；不启用 torch.compile。
+export MINIMAX_H3_MUSA_FUSED_ROPE="${MINIMAX_H3_MUSA_FUSED_ROPE:-0}"
+export MINIMAX_H3_MUSA_FUSED_SWIGLU="${MINIMAX_H3_MUSA_FUSED_SWIGLU:-0}"
 
-# 零目标 loss 仓库默认开启；指定模块 FP32 仓库默认关闭，本脚本对齐 zip 开启。
-export MINIMAX_H3_ZERO_TARGET_LOSS="${MINIMAX_H3_ZERO_TARGET_LOSS:-1}"
-export MINIMAX_H3_FP32_MODULES="${MINIMAX_H3_FP32_MODULES:-1}"
+# 本脚本默认使用 flow-matching loss，并关闭指定模块 FP32；均可通过环境变量覆盖。
+export MINIMAX_H3_ZERO_TARGET_LOSS="${MINIMAX_H3_ZERO_TARGET_LOSS:-0}"
+export MINIMAX_H3_FP32_MODULES="${MINIMAX_H3_FP32_MODULES:-0}"
 
 # ---------- 6. FSDP2 配置 ----------
 # YAML 在用户真正执行启动脚本时生成；每台独立文件名，避免并发覆盖。

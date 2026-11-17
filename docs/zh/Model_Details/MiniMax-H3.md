@@ -27,7 +27,7 @@ pip install -e .
 
 FP32 开关开启时仅重新读取上述模块的原始权重，避免先经 BF16 舍入。FSDP2 为这些模块单独设置 FP32 参数策略，沿用配置的 mesh、reshard、offload 和归约精度；其余模块仍使用原计算精度。时间 embedding 在各 AdaLN 线性层前转换到该层参数精度。当前不支持 FSDP1、DeepSpeed 或 `fsdp_cpu_ram_efficient_loading=true` 与此开关组合。
 
-`start_ref2va_multinode.sh` 显式开启两个开关，采用 FP32 归约、固定 `1e-5` 学习率、`warm_up_steps=0` 和 `max_grad_norm=0`。仍为 microbatch 1、累积 2、4 机 32 卡、global batch 64；优化器、compile、融合算子、profiler 和保存配置保持原设置。
+`start_ref2va_multinode.sh` 将 `MINIMAX_H3_ZERO_TARGET_LOSS`、`MINIMAX_H3_FP32_MODULES`、`MINIMAX_H3_MUSA_FUSED_ROPE`、`MINIMAX_H3_MUSA_FUSED_SWIGLU` 均默认为 `0`，允许通过环境变量分别覆盖。因此脚本默认使用 flow-matching loss；仓库自身的环境变量默认值仍以上表为准。脚本采用 FP32 归约、固定 `1e-5` 学习率、`warm_up_steps=0` 和 `max_grad_norm=0`。仍为 microbatch 1、累积 2、4 机 32 卡、global batch 64；优化器、compile、profiler 和保存配置保持原设置。
 
 启动前通过环境变量指定 `MODEL_DIR` 和 `MASTER_ADDR`。`REPO_DIR` 默认脚本所在目录，`PYTHON_BIN` 默认当前环境的 `python`，`OUTPUT_DIR` 默认 `$REPO_DIR/runs/ref2va-fsdp2`；这些路径均可覆盖，路径配置请使用绝对路径。脚本仅提供通用示例，不包含部署机器的实际路径或地址。
 
