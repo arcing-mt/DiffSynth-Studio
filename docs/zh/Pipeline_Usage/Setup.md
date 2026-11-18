@@ -37,6 +37,14 @@ pip install diffsynth
 
 按照以上方式安装即可。
 
+### Moore Threads MUSA
+
+先使用 MUSA 镜像或厂商提供的匹配版本安装 `torch`、`torch_musa` 和 `torchvision`，再使用该环境的 Python 执行 `python -m pip install -e .`。基础安装复用已满足要求的包；不要加 `--upgrade`。
+
+`entropack>=0.1.7` 要求 `torch>=2.10`，因此仅放在 `[quant]` / `[all]` 中。已有 torch 2.7.1 / 2.9.1 的 MUSA 环境不要安装这两组依赖。使用 EntroPack 的量化和低显存示例仍需单独安装兼容的后端；基础安装不提供这些功能。
+
+音频和训练依赖应沿用镜像中验证过的版本。需要补装 `[audio]` / `[training]` 时，使用针对当前环境的 constraints 文件保护已有框架版本，先通过 `python -m pip install --dry-run -c <constraints.txt> -e ".[audio,training]"` 检查安装计划；尤其不要让音频包替换 MUSA 版 torch。
+
 ### AMD GPU
 
 需安装支持 ROCm 的 `torch` 包，以 ROCm 6.4（本文更新于 2025 年 12 月 15 日）、Linux 系统为例，请运行以下命令

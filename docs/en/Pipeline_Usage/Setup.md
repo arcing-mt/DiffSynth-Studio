@@ -37,6 +37,14 @@ You can install multiple sets of dependencies with `pip install -e ".[audio,quan
 
 Install as described above.
 
+### Moore Threads MUSA
+
+Install matching `torch`, `torch_musa`, and `torchvision` builds from a MUSA image or vendor distribution first, then run `python -m pip install -e .` with that environment's Python. The base installation reuses installed packages that satisfy its requirements; do not add `--upgrade`.
+
+`entropack>=0.1.7` requires `torch>=2.10`, so it is only included in `[quant]` / `[all]`. Do not install those extras in MUSA environments using torch 2.7.1 / 2.9.1. Quantization and low-VRAM examples using EntroPack still require a separately installed compatible backend; the base installation does not provide those features.
+
+Reuse the audio and training packages validated in your image. If you need `[audio]` / `[training]`, protect the installed framework versions with an environment-specific constraints file and inspect the plan with `python -m pip install --dry-run -c <constraints.txt> -e ".[audio,training]"` first. In particular, audio dependencies must not replace the MUSA torch build.
+
 ### AMD GPU
 
 You need to install the `torch` package with ROCm support. Taking ROCm 6.4 (as of the article update date: December 15, 2025) on Linux as an example, run the following command:
