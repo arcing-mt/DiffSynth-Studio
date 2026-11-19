@@ -1,17 +1,22 @@
-"""Synthetic benchmark inputs and optional FP32 modules for H3 training."""
+"""Synthetic inputs, precision controls and block compilation for H3 training."""
 
 import os
 from types import MethodType
 
 import torch
 
-from diffsynth.models.minimax_h3_dit import MiniMaxH3DiT, unpatchify_video, unpack_audio
+from diffsynth.models.minimax_h3_dit import (
+    MiniMaxH3DiT, MiniMaxH3DiTBlock, MiniMaxH3Attention,
+    MiniMaxH3TokenRefinerBlock, unpatchify_video, unpack_audio,
+)
 
 
 FP32_MODULES = (
     "video_patch_proj", "audio_patch_proj", "time_embedder",
     "final_layer.video_out", "final_layer.audio_out", "rope",
 )
+
+COMPILE_MODULE_TYPES = (MiniMaxH3DiTBlock, MiniMaxH3TokenRefinerBlock)
 
 
 def h3_env_enabled(name, default=False):
@@ -61,6 +66,48 @@ def configure_h3_fp32_modules(dit, model_configs=()):
         if remaining:
             raise ValueError(f"Missing original H3 FP32 weights: {sorted(remaining)}")
     dit._h3_fp32_modules = True
+
+
+def configure_h3_compile(dit, enabled=False, safe_norm=False, safe_attention=False):
+    """Compile H3's repeated blocks before FSDP wrapping.
+
+    This follows the benchmark zip: ``dynamic=False`` is used for the fixed
+    packed shapes, while selected normalization/attention functions can be
+    kept outside the compiled graph. The root DiT, pipeline and output
+    projections remain eager. Only forwards are compiled, leaving FSDP hooks
+    outside the graph and preserving module types and checkpoint keys.
+    """
+    if not enabled:
+        return 0
+    if getattr(dit, "_h3_compile_enabled", False):
+        return 0
+    if not hasattr(torch, "compile") or not hasattr(torch, "compiler"):
+        raise RuntimeError("H3 block compilation requires torch.compile and torch.compiler.disable.")
+    if type(dit) is not MiniMaxH3DiT or getattr(dit, "vdn_enabled", False) or getattr(dit, "quantize_config", None) is not None:
+        raise ValueError("H3 block compilation requires the ordinary, unquantized H3 DiT.")
+
+    if safe_norm:
+        for module in dit.modules():
+            if isinstance(module, torch.nn.RMSNorm) and not getattr(module, "_h3_compile_safe_norm", False):
+                module.forward = torch.compiler.disable(module.forward)
+                module._h3_compile_safe_norm = True
+
+    if safe_attention:
+        for module in dit.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module.compute_attention = torch.compiler.disable(module.compute_attention)
+
+    compiled = 0
+    for module in dit.modules():
+        if type(module) in COMPILE_MODULE_TYPES and not getattr(module, "_h3_compile_enabled", False):
+            module.compile(dynamic=False)
+            module._h3_compile_enabled = True
+            compiled += 1
+    # Zip's AdaLayerNormOut excludes the separately managed output projections.
+    dit.final_layer.modulate = torch.compile(dit.final_layer.modulate, dynamic=False)
+    compiled += 1
+    dit._h3_compile_enabled = True
+    return compiled
 
 
 def shard_h3_fp32_modules(model, accelerator):

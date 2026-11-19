@@ -151,6 +151,9 @@ class MiniMaxH3Attention(nn.Module):
     def apply_rotary_emb(self, x, freqs, rope_cos=None, rope_sin=None):
         return _apply_rope(x, freqs, rope_cos, rope_sin)
 
+    def compute_attention(self, q, k, v, cu_seqlens):
+        return _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
+
     def forward(self, x, *, rope_freqs, cu_seqlens, max_seqlen=None, rope_cos=None, rope_sin=None):
         total = x.shape[0]
         qkv = self.qkv_proj(x)
@@ -163,7 +166,7 @@ class MiniMaxH3Attention(nn.Module):
         if rope_freqs is not None:
             q = self.apply_rotary_emb(q, rope_freqs, rope_cos, rope_sin)
             k = self.apply_rotary_emb(k, rope_freqs, rope_cos, rope_sin)
-        out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
+        out = self.compute_attention(q, k, v, cu_seqlens)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -266,10 +269,13 @@ class MiniMaxH3FinalLayer(nn.Module):
         self.video_out = nn.Linear(hidden_size, video_patch_dim, bias=True)
         self.audio_out = nn.Linear(hidden_size, audio_latents_dim, bias=True)
 
-    def forward(self, x, *, t_emb, inverse_indices):
+    def modulate(self, x, *, t_emb, inverse_indices):
         shift, scale = self.adaln_proj(t_emb)
         h = self.norm(x)
-        h = _modulate_scale_shift(h, shift, scale, inverse_indices)
+        return _modulate_scale_shift(h, shift, scale, inverse_indices)
+
+    def forward(self, x, *, t_emb, inverse_indices):
+        h = self.modulate(x, t_emb=t_emb, inverse_indices=inverse_indices)
         video = self.video_out(h)
         audio = self.audio_out(h)
         return video, audio

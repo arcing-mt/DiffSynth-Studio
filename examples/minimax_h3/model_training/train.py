@@ -3,7 +3,10 @@ from diffsynth.core import UnifiedDataset
 from diffsynth.core.profiler import profile_scope
 from diffsynth.core.musa_patch import apply_minimax_h3_musa_patch
 from diffsynth.diffusion.fsdp2 import add_fsdp2_training_options, fsdp2_accelerator_kwargs, configure_fsdp2_training
-from diffsynth.diffusion.minimax_h3_training import MiniMaxH3SyntheticDataset, configure_h3_fp32_modules, shard_h3_fp32_modules
+from diffsynth.diffusion.minimax_h3_training import (
+    MiniMaxH3SyntheticDataset, configure_h3_compile, configure_h3_fp32_modules,
+    shard_h3_fp32_modules,
+)
 from diffsynth.core.data.operators import LoadAudioWithTorchaudio, ToAbsolutePath
 from diffsynth.utils.data.minimax_h3 import MiniMaxH3ReferenceLoader
 from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3Pipeline, ModelConfig
@@ -38,6 +41,9 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         task="sft",
         torch_dtype=torch.bfloat16,
         synthetic_inputs=False,
+        compile_blocks=False,
+        compile_safe_norm=False,
+        compile_safe_attention=False,
     ):
         super().__init__()
         if training_cfg_scale < 1.0:
@@ -70,6 +76,15 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
+        compiled = configure_h3_compile(
+            self.pipe.dit,
+            enabled=compile_blocks and task in ("sft", "sft:train"),
+            safe_norm=compile_safe_norm,
+            safe_attention=compile_safe_attention,
+        )
+        if compiled:
+            print(f"MiniMax-H3 torch.compile: {compiled} regions, dynamic=False, "
+                  f"safe_norm={compile_safe_norm}, safe_attention={compile_safe_attention}.")
         self.pipe.scheduler_audio.set_timesteps(1000, training=True)
 
         # Store other configs
@@ -167,6 +182,9 @@ def minimax_h3_parser():
     # Synthetic inputs do not need a dataset directory; validate real data below.
     parser._option_string_actions["--dataset_base_path"].required = False
     parser.add_argument("--synthetic_inputs", action="store_true", help="Use fixed random video/audio latents and 256 text embeddings, at 24fps, without VAE/processor/reference data. dataset_repeat is the total sample count; requires dataset_num_workers=0.")
+    parser.add_argument("--compile_blocks", action="store_true", help="Compile H3 transformer/token-refiner forwards and output AdaLN with torch.compile(dynamic=False) before FSDP wrapping. Training only; disabled by default.")
+    parser.add_argument("--compile_safe_norm", action="store_true", help="Keep RMSNorm forwards outside H3 block compilation. Use with --compile_blocks when the backend has norm compiler issues.")
+    parser.add_argument("--compile_safe_attention", action="store_true", help="Keep H3 attention backend calls outside block compilation. Use with --compile_blocks when the backend has attention compiler issues.")
     parser.add_argument("--processor_path", type=str, default=None, help="Path or `model_id:pattern` of the Qwen3-VL processor.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--silent_on_missing_audio", default=False, action="store_true", help="Whether to use silent audio as a fallback when no audio track is present in the video data.")
@@ -258,6 +276,9 @@ if __name__ == "__main__":
     model = MiniMaxH3TrainingModule(
         torch_dtype=accelerator.diffsynth_fsdp2_options.computation_dtype if getattr(accelerator, "is_fsdp2", False) else torch.bfloat16,
         synthetic_inputs=args.synthetic_inputs,
+        compile_blocks=args.compile_blocks,
+        compile_safe_norm=args.compile_safe_norm,
+        compile_safe_attention=args.compile_safe_attention,
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         processor_path=args.processor_path,

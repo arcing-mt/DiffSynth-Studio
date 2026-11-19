@@ -33,6 +33,14 @@ FP32 开关开启时仅重新读取上述模块的原始权重，避免先经 BF
 
 启动前通过环境变量指定 `MODEL_DIR` 和 `MASTER_ADDR`。`REPO_DIR` 默认脚本所在目录，`PYTHON_BIN` 默认当前环境的 `python`，`OUTPUT_DIR` 默认 `$REPO_DIR/runs/ref2va-fsdp2`；这些路径均可覆盖，路径配置请使用绝对路径。脚本仅提供通用示例，不包含部署机器的实际路径或地址。
 
+## 分块编译
+
+训练默认不开启 `torch.compile`。四机脚本可设置 `MINIMAX_H3_COMPILE=1` 开启；脚本中的 `MINIMAX_H3_COMPILE_SAFE_NORM` 和 `MINIMAX_H3_COMPILE_SAFE_ATTENTION` 默认均为 `1`，仅在编译开启时生效，可分别设为 `0`。直接运行训练入口时使用 `--compile_blocks`，并按需添加 `--compile_safe_norm --compile_safe_attention`。
+
+沿用复现 zip 的 `dynamic=False` 分块方式：编译各 DiT block、token refiner block 的 forward，以及输出层的 AdaLN 部分；输入投影、时间 embedding、RoPE 表生成、输出投影和 pipeline 保持 eager。编译在 MUSA patch、精度设置、LoRA 和权重恢复之后、FSDP 包装之前安装，保留模块类型、参数及 checkpoint 键名，不改变 FSDP 分片策略。当前仅支持普通、非量化 H3 DiT 的 `sft` / `sft:train` 路径，数据预处理不启用编译。
+
+safe norm 将当前实例的 RMSNorm forward 排除在编译图外；safe attention 将当前实例的变长 attention 调用（包括分段、后端派发）排除在图外，QKV 和输出投影仍可编译。不修改全局 attention 函数。这里没有 zip 中的 `get_parameter_dtype` 遍历查询，因此不需要其 `compile-safe-dtype` 补丁。首次执行会触发编译，输入形状变化可能重编译；编译后的浮点结果允许正常舍入差异，实际 MUSA 性能和数值需在目标环境验证。
+
 ## FSDP2 训练选项
 
 H3 训练脚本支持以下 `--fsdp2_*` 选项，需使用 FSDP2 的 Accelerate 启动配置。未指定时保留当前默认行为；布尔值可写 `true/false` 或 `1/0`，也可省略值表示 `true`。

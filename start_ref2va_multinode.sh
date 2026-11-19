@@ -87,13 +87,36 @@ export GLOO_SOCKET_IFNAME="${NET_IFACE:-bond0}"
 export MCCL_DEBUG=WARN
 export TORCH_DISTRIBUTED_DEBUG=OFF
 
-# 融合算子默认关闭，可通过环境变量启用；不启用 torch.compile。
+# 融合算子默认关闭，可通过环境变量启用。
 export MINIMAX_H3_MUSA_FUSED_ROPE="${MINIMAX_H3_MUSA_FUSED_ROPE:-0}"
 export MINIMAX_H3_MUSA_FUSED_SWIGLU="${MINIMAX_H3_MUSA_FUSED_SWIGLU:-0}"
 
 # 本脚本默认使用 flow-matching loss，并关闭指定模块 FP32；均可通过环境变量覆盖。
 export MINIMAX_H3_ZERO_TARGET_LOSS="${MINIMAX_H3_ZERO_TARGET_LOSS:-0}"
 export MINIMAX_H3_FP32_MODULES="${MINIMAX_H3_FP32_MODULES:-0}"
+# 分块编译默认关闭；开启时默认沿用 zip 的 RMSNorm/attention 编译绕过。
+export MINIMAX_H3_COMPILE="${MINIMAX_H3_COMPILE:-0}"
+export MINIMAX_H3_COMPILE_SAFE_NORM="${MINIMAX_H3_COMPILE_SAFE_NORM:-1}"
+export MINIMAX_H3_COMPILE_SAFE_ATTENTION="${MINIMAX_H3_COMPILE_SAFE_ATTENTION:-1}"
+
+COMPILE_ARGS=()
+case "$MINIMAX_H3_COMPILE" in
+    1|true|TRUE|yes|YES|on|ON)
+        COMPILE_ARGS+=(--compile_blocks)
+        case "$MINIMAX_H3_COMPILE_SAFE_NORM" in
+            1|true|TRUE|yes|YES|on|ON) COMPILE_ARGS+=(--compile_safe_norm) ;;
+            0|false|FALSE|no|NO|off|OFF) ;;
+            *) echo "MINIMAX_H3_COMPILE_SAFE_NORM 必须是 0/1 或 true/false。" >&2; exit 1 ;;
+        esac
+        case "$MINIMAX_H3_COMPILE_SAFE_ATTENTION" in
+            1|true|TRUE|yes|YES|on|ON) COMPILE_ARGS+=(--compile_safe_attention) ;;
+            0|false|FALSE|no|NO|off|OFF) ;;
+            *) echo "MINIMAX_H3_COMPILE_SAFE_ATTENTION 必须是 0/1 或 true/false。" >&2; exit 1 ;;
+        esac
+        ;;
+    0|false|FALSE|no|NO|off|OFF) ;;
+    *) echo "MINIMAX_H3_COMPILE 必须是 0/1 或 true/false。" >&2; exit 1 ;;
+esac
 
 # ---------- 6. FSDP2 配置 ----------
 # YAML 在用户真正执行启动脚本时生成；每台独立文件名，避免并发覆盖。
@@ -133,7 +156,7 @@ print(json.dumps([sorted(glob.glob(sys.argv[1] + "/Ref2VA/transformer/model*.saf
 # sync_each_batch=true：用户已明确同意；使用仓库原生参数。
 # disable_model_save：分支原生参数，关闭所有模型保存。
 # 开启普通梯度检查点；没有CPU/disk/optimizer/activation offload。
-# 参数输出在日志中可直接审阅，不替换任何Python类或函数。
+# 参数输出在日志中可直接审阅。
 printf 'node_rank=%s nodes=%s world_size=%s microbatch=%s accumulation=%s global_batch=%s\n' \
     "$NODE_RANK" "$NNODES" "$WORLD_SIZE" "$MICRO_BATCH_SIZE" "$GRAD_ACCUM_STEPS" "$GLOBAL_BATCH_SIZE"
 cd "$REPO_DIR"
@@ -147,6 +170,7 @@ exec "$PYTHON_BIN" -m accelerate.commands.launch \
     --main_process_port "$MASTER_PORT" \
     examples/minimax_h3/model_training/train.py \
     --synthetic_inputs \
+    "${COMPILE_ARGS[@]}" \
     --dataset_repeat "$DATASET_REPEAT" \
     --dataset_num_workers 0 \
     --height "$HEIGHT" --width "$WIDTH" --num_frames "$NUM_FRAMES" \

@@ -33,6 +33,14 @@ Set `MODEL_DIR` and `MASTER_ADDR` through environment variables before launching
 
 The launcher also supports peak-memory monitoring. Set `MEMORY_MONITOR_ENABLE=1` to write `peak_memory_rank*.csv` and matching JSON summaries under `MEMORY_MONITOR_DIR` (default `$OUTPUT_DIR/peak_memory`) on each rank. Each row includes current/peak allocated and reserved memory, the microstep, optimizer step, and whether gradients synchronized; `MEMORY_MONITOR_INTERVAL` controls the sampling interval in microsteps. Monitoring synchronizes the device before and after each sampled step so asynchronous kernels are included, which adds overhead; it is disabled by default.
 
+## Block Compilation
+
+Training leaves `torch.compile` off by default. Set `MINIMAX_H3_COMPILE=1` in the multinode launcher to enable it. The launcher defaults `MINIMAX_H3_COMPILE_SAFE_NORM` and `MINIMAX_H3_COMPILE_SAFE_ATTENTION` to `1`; they only take effect when compilation is enabled and can independently be set to `0`. When calling the training entry point directly, pass `--compile_blocks` and optionally `--compile_safe_norm --compile_safe_attention`.
+
+Following the reproduction zip, `dynamic=False` compiles each DiT/token-refiner block forward and the output AdaLN computation. Input projections, time embeddings, RoPE table generation, output projections and the pipeline remain eager. Compilation is installed after MUSA patches, precision setup, LoRA and checkpoint restoration, before FSDP wrapping. Module types, parameters, checkpoint keys and the FSDP sharding policy are preserved. This currently targets ordinary, unquantized H3 DiTs on the `sft` / `sft:train` paths; preprocessing stays eager.
+
+Safe norm excludes this instance's RMSNorm forwards from compilation. Safe attention excludes its variable-length attention call, including segmentation and backend dispatch; QKV and output projections can still compile. Global attention functions are unchanged. This implementation does not use the zip's parameter-traversing `get_parameter_dtype`, so its `compile-safe-dtype` workaround is unnecessary here. First use triggers compilation, and shape changes can trigger recompilation. Floating-point rounding differences are possible; MUSA performance and numerical behavior require validation on the target environment.
+
 ## FSDP2 Training Options
 
 The H3 training script accepts the following `--fsdp2_*` options with an Accelerate FSDP2 launch configuration. Omitted options preserve the current defaults. Boolean values accept `true/false` or `1/0`; omitting a boolean's value means `true`.
