@@ -31,6 +31,8 @@ The FP32 option reloads only these modules' original weights to avoid BF16 round
 
 Set `MODEL_DIR` and `MASTER_ADDR` through environment variables before launching. `REPO_DIR` defaults to the script directory, `PYTHON_BIN` to the current environment's `python`, and `OUTPUT_DIR` to `$REPO_DIR/runs/ref2va-fsdp2`. All paths can be overridden; use absolute paths for path settings. The script contains generic examples, without deployment-specific paths or addresses.
 
+The launcher also supports peak-memory monitoring. Set `MEMORY_MONITOR_ENABLE=1` to write `peak_memory_rank*.csv` and matching JSON summaries under `MEMORY_MONITOR_DIR` (default `$OUTPUT_DIR/peak_memory`) on each rank. Each row includes current/peak allocated and reserved memory, the microstep, optimizer step, and whether gradients synchronized; `MEMORY_MONITOR_INTERVAL` controls the sampling interval in microsteps. Monitoring synchronizes the device before and after each sampled step so asynchronous kernels are included, which adds overhead; it is disabled by default.
+
 ## FSDP2 Training Options
 
 The H3 training script accepts the following `--fsdp2_*` options with an Accelerate FSDP2 launch configuration. Omitted options preserve the current defaults. Boolean values accept `true/false` or `1/0`; omitting a boolean's value means `true`.

@@ -29,6 +29,8 @@ FP32 开关开启时仅重新读取上述模块的原始权重，避免先经 BF
 
 `start_ref2va_multinode.sh` 将 `MINIMAX_H3_ZERO_TARGET_LOSS`、`MINIMAX_H3_FP32_MODULES`、`MINIMAX_H3_MUSA_FUSED_ROPE`、`MINIMAX_H3_MUSA_FUSED_SWIGLU` 均默认为 `0`，允许通过环境变量分别覆盖。因此脚本默认使用 flow-matching loss；仓库自身的环境变量默认值仍以上表为准。脚本采用 FP32 归约、固定 `1e-5` 学习率、`warm_up_steps=0` 和 `max_grad_norm=0`。仍为 microbatch 1、累积 2、4 机 32 卡、global batch 64；优化器、compile、profiler 和保存配置保持原设置。
 
+启动脚本还支持峰值显存监控：设置 `MEMORY_MONITOR_ENABLE=1` 后，每个 rank 会在 `MEMORY_MONITOR_DIR`（默认 `$OUTPUT_DIR/peak_memory`）写入 `peak_memory_rank*.csv` 和对应 JSON 汇总。每条记录包含当前/峰值 allocated 和 reserved 显存、microstep、optimizer step 及是否发生梯度同步；`MEMORY_MONITOR_INTERVAL` 可设置为每隔多少个 microstep 记录一次。监控开启时会在记录前后同步设备，以纳入异步 kernel 的显存峰值并带来额外开销；默认关闭。
+
 启动前通过环境变量指定 `MODEL_DIR` 和 `MASTER_ADDR`。`REPO_DIR` 默认脚本所在目录，`PYTHON_BIN` 默认当前环境的 `python`，`OUTPUT_DIR` 默认 `$REPO_DIR/runs/ref2va-fsdp2`；这些路径均可覆盖，路径配置请使用绝对路径。脚本仅提供通用示例，不包含部署机器的实际路径或地址。
 
 ## FSDP2 训练选项

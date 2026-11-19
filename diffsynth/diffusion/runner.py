@@ -6,6 +6,7 @@ from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 from diffsynth.core import OffloadTrainingManager
 from diffsynth.core.profiler import TrainingProfiler, profile_scope
+from diffsynth.core.memory_monitor import PeakMemoryMonitor
 
 
 def get_optimizer_class(customized_optimizer=None):
@@ -111,10 +112,16 @@ def launch_training_task(
     initialize_deepspeed_gradient_checkpointing(accelerator)
     with (
         TrainingProfiler(model_logger.output_path, accelerator.device, accelerator.process_index) as profiler,
+        PeakMemoryMonitor(model_logger.output_path, accelerator.device, accelerator.process_index) as memory_monitor,
         fsdp2_options.training(model) if fsdp2_options is not None else nullcontext(),
     ):
+        microstep = 0
+        optimizer_steps = 0
         for epoch_id in range(num_epochs):
             for data in profiler.iter_dataloader(tqdm(dataloader)):
+                microstep += 1
+                memory_monitor.before_step(microstep)
+                step_sync_gradients = False
                 with (
                     profile_scope("diffsynth/train_step"),
                     accelerator.accumulate(model),
@@ -145,6 +152,10 @@ def launch_training_task(
                         optimizer.zero_grad()
                     with profile_scope("diffsynth/log_and_checkpoint"):
                         model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                    step_sync_gradients = accelerator.sync_gradients
+                if step_sync_gradients:
+                    optimizer_steps += 1
+                memory_monitor.after_step(microstep, optimizer_steps, step_sync_gradients)
                 # Count batches, including gradient-accumulation microsteps.
                 profiler.step()
             if save_steps is None:
