@@ -44,6 +44,9 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         compile_blocks=False,
         compile_safe_norm=False,
         compile_safe_attention=False,
+        activation_offload_layers=0,
+        activation_gpu_layers=0,
+        activation_offload_gib=8.0,
     ):
         super().__init__()
         if training_cfg_scale < 1.0:
@@ -76,6 +79,23 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
+        self.cache_fa = bool(activation_offload_layers or activation_gpu_layers)
+        if self.cache_fa:
+            from diffsynth.core.attention.attention import ATTENTION_IMPLEMENTATION
+            from diffsynth.core.gradient.minimax_h3_offload import H3ActivationOffload
+            from diffsynth.models.minimax_h3_dit import MiniMaxH3DiT
+
+            if task not in ("sft", "sft:train") or not use_gradient_checkpointing or use_gradient_checkpointing_offload:
+                raise ValueError("H3 activation caching requires SFT with --use_gradient_checkpointing and checkpoint input offload disabled.")
+            if compile_blocks or type(self.pipe.dit) is not MiniMaxH3DiT or getattr(self.pipe.dit, "vdn_enabled", False):
+                raise ValueError("H3 activation caching currently supports eager ordinary MiniMaxH3DiT blocks.")
+            if ATTENTION_IMPLEMENTATION != "torch":
+                raise ValueError("Set DIFFSYNTH_ATTENTION_IMPLEMENTATION=torch before launching H3 activation caching.")
+            self.pipe.dit._activation_offload = H3ActivationOffload(
+                len(self.pipe.dit.blocks), activation_offload_layers, activation_gpu_layers, activation_offload_gib,
+            )
+            print(f"H3 Flash SDPA cache: first {activation_offload_layers} blocks on CPU, "
+                  f"last {activation_gpu_layers} on GPU, pinned payload limit {activation_offload_gib:g} GiB/rank.")
         compiled = configure_h3_compile(
             self.pipe.dit,
             enabled=compile_blocks and task in ("sft", "sft:train"),
@@ -170,6 +190,11 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         for unit in (() if self.synthetic_inputs else self.pipe.units):
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         with profile_scope("diffsynth/model_and_loss"):
+            if self.cache_fa:
+                # Split-training inputs may carry checkpoint flags from an older
+                # data-processing run. Apply this run's explicit training policy.
+                shared, posi, nega = inputs
+                inputs = (dict(shared, use_gradient_checkpointing=True, use_gradient_checkpointing_offload=False), posi, nega)
             loss = self.task_to_loss[self.task](self.pipe, *inputs)
         return loss
 
@@ -182,6 +207,9 @@ def minimax_h3_parser():
     # Synthetic inputs do not need a dataset directory; validate real data below.
     parser._option_string_actions["--dataset_base_path"].required = False
     parser.add_argument("--synthetic_inputs", action="store_true", help="Use fixed random video/audio latents and 256 text embeddings, at 24fps, without VAE/processor/reference data. dataset_repeat is the total sample count; requires dataset_num_workers=0.")
+    parser.add_argument("--activation_offload_layers", type=int, default=0, help="Offload native MUSA Flash SDPA results of the first N DiT blocks to pinned CPU memory. Requires eager checkpointing and DIFFSYNTH_ATTENTION_IMPLEMENTATION=torch.")
+    parser.add_argument("--activation_gpu_layers", type=int, default=0, help="Keep Flash SDPA results of the last N DiT blocks on GPU. The middle blocks recompute.")
+    parser.add_argument("--activation_offload_gib", type=float, default=8.0, help="Maximum live offloaded tensor payload in GiB per rank; segments over budget recompute. Allocator reservations can be larger.")
     parser.add_argument("--compile_blocks", action="store_true", help="Compile H3 transformer/token-refiner forwards and output AdaLN with torch.compile(dynamic=False) before FSDP wrapping. Training only; disabled by default.")
     parser.add_argument("--compile_safe_norm", action="store_true", help="Keep RMSNorm forwards outside H3 block compilation. Use with --compile_blocks when the backend has norm compiler issues.")
     parser.add_argument("--compile_safe_attention", action="store_true", help="Keep H3 attention backend calls outside block compilation. Use with --compile_blocks when the backend has attention compiler issues.")
@@ -276,6 +304,9 @@ if __name__ == "__main__":
     model = MiniMaxH3TrainingModule(
         torch_dtype=accelerator.diffsynth_fsdp2_options.computation_dtype if getattr(accelerator, "is_fsdp2", False) else torch.bfloat16,
         synthetic_inputs=args.synthetic_inputs,
+        activation_offload_layers=args.activation_offload_layers,
+        activation_gpu_layers=args.activation_gpu_layers,
+        activation_offload_gib=args.activation_offload_gib,
         compile_blocks=args.compile_blocks,
         compile_safe_norm=args.compile_safe_norm,
         compile_safe_attention=args.compile_safe_attention,

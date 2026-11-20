@@ -82,7 +82,9 @@ def _seqlen_bounds(cu_seqlens):
     return tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else tuple(cu_seqlens)
 
 
-def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
+def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, segment_attention=None):
+    if segment_attention is None:
+        segment_attention = attention_forward
     out = torch.empty_like(q)
     bounds = _seqlen_bounds(cu_seqlens)
     for start, stop in zip(bounds[:-1], bounds[1:]):
@@ -91,7 +93,7 @@ def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
         seg_q = q[start:stop].transpose(0, 1).unsqueeze(0)
         seg_k = k[start:stop].transpose(0, 1).unsqueeze(0)
         seg_v = v[start:stop].transpose(0, 1).unsqueeze(0)
-        seg_out = attention_forward(seg_q, seg_k, seg_v, scale=softmax_scale)
+        seg_out = segment_attention(seg_q, seg_k, seg_v, scale=softmax_scale)
         out[start:stop] = seg_out.squeeze(0).transpose(0, 1)
     return out
 
@@ -154,7 +156,7 @@ class MiniMaxH3Attention(nn.Module):
     def compute_attention(self, q, k, v, cu_seqlens):
         return _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
 
-    def forward(self, x, *, rope_freqs, cu_seqlens, max_seqlen=None, rope_cos=None, rope_sin=None):
+    def forward(self, x, *, rope_freqs, cu_seqlens, max_seqlen=None, rope_cos=None, rope_sin=None, segment_attention=None):
         total = x.shape[0]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
@@ -166,7 +168,10 @@ class MiniMaxH3Attention(nn.Module):
         if rope_freqs is not None:
             q = self.apply_rotary_emb(q, rope_freqs, rope_cos, rope_sin)
             k = self.apply_rotary_emb(k, rope_freqs, rope_cos, rope_sin)
-        out = self.compute_attention(q, k, v, cu_seqlens)
+        if segment_attention is None:
+            out = self.compute_attention(q, k, v, cu_seqlens)
+        else:
+            out = _sdpa_varlen_attention(q, k, v, cu_seqlens, self.softmax_scale, segment_attention)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -245,12 +250,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
         self.adaln_proj = MiniMaxH3AdalnProj(hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM)
 
-    def forward(self, x, *, t_emb, combined_indices, rope_freqs, cu_seqlens, max_seqlen, rope_cos=None, rope_sin=None):
+    def forward(self, x, *, t_emb, combined_indices, rope_freqs, cu_seqlens, max_seqlen, rope_cos=None, rope_sin=None, segment_attention=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices)
         rope_inputs = {} if rope_cos is None and rope_sin is None else dict(rope_cos=rope_cos, rope_sin=rope_sin)
+        if segment_attention is not None:
+            rope_inputs["segment_attention"] = segment_attention
         h = self.attn(h, rope_freqs=rope_freqs, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, **rope_inputs)
         x = _modulate_gate(residual, gate_msa, h, combined_indices)
         residual = x
@@ -414,6 +421,12 @@ class MiniMaxH3DiT(nn.Module):
             # FSDP skips its forward input cast during checkpoint replay.
             # Save inputs in the actual compute dtype outside that boundary.
             rope_freqs = rope_freqs.to(decoder_input.dtype)
+        run_cached_block = None
+        policy = getattr(self, "_activation_offload", None)
+        if policy is not None and torch.is_grad_enabled() and use_gradient_checkpointing:
+            if use_gradient_checkpointing_offload:
+                raise ValueError("Choose either H3 FA activation caching or checkpoint input offload.")
+            run_cached_block = policy.begin_forward(hidden.device)
         for block_id, block in enumerate(self.blocks):
             # Only hidden activations need to return to the next block's
             # compute dtype. Do not downcast positions/angles just because a
@@ -421,11 +434,7 @@ class MiniMaxH3DiT(nn.Module):
             # checkpoint so replay sees the same inputs as the first forward.
             if hidden.dtype != decoder_input.dtype:
                 hidden = hidden.to(decoder_input.dtype)
-            hidden = gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing,
-                use_gradient_checkpointing_offload,
-                hidden,
+            block_kwargs = dict(
                 t_emb=t_emb,
                 combined_indices=combined_indices,
                 rope_freqs=rope_freqs,
@@ -433,6 +442,10 @@ class MiniMaxH3DiT(nn.Module):
                 max_seqlen=max_seqlen,
                 **rope_inputs,
             )
+            if run_cached_block is None:
+                hidden = gradient_checkpoint_forward(block, use_gradient_checkpointing, use_gradient_checkpointing_offload, hidden, **block_kwargs)
+            else:
+                hidden = run_cached_block(block_id, block, hidden, **block_kwargs)
             if control_hints is not None and block_id in control_hints:
                 hidden = hidden + control_hints[block_id].to(hidden.device, hidden.dtype)
 

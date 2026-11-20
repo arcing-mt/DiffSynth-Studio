@@ -99,6 +99,18 @@ export MINIMAX_H3_COMPILE="${MINIMAX_H3_COMPILE:-0}"
 export MINIMAX_H3_COMPILE_SAFE_NORM="${MINIMAX_H3_COMPILE_SAFE_NORM:-1}"
 export MINIMAX_H3_COMPILE_SAFE_ATTENTION="${MINIMAX_H3_COMPILE_SAFE_ATTENTION:-1}"
 
+# FA 激活缓存：前 N 层异步 DMA 到本机 pinned RAM，末 K 层留显存，中间层重算。
+# 示例：MINIMAX_H3_ACTIVATION_OFFLOAD_LAYERS=8 MINIMAX_H3_ACTIVATION_GPU_LAYERS=2
+# 53,856 tokens 时每层 O+LSE 约 0.730 GiB/rank；8 层约 46.74 GiB/node（8 卡）。
+ACTIVATION_ARGS=()
+cpu_layers="${MINIMAX_H3_ACTIVATION_OFFLOAD_LAYERS:-0}"
+gpu_layers="${MINIMAX_H3_ACTIVATION_GPU_LAYERS:-0}"
+if [[ "$cpu_layers" != 0 || "$gpu_layers" != 0 ]]; then
+    export DIFFSYNTH_ATTENTION_IMPLEMENTATION="${DIFFSYNTH_ATTENTION_IMPLEMENTATION:-torch}"
+    ACTIVATION_ARGS+=(--activation_offload_layers "$cpu_layers" --activation_gpu_layers "$gpu_layers"
+                      --activation_offload_gib "${MINIMAX_H3_ACTIVATION_OFFLOAD_GIB:-8}")
+fi
+
 COMPILE_ARGS=()
 case "$MINIMAX_H3_COMPILE" in
     1|true|TRUE|yes|YES|on|ON)
@@ -155,7 +167,7 @@ print(json.dumps([sorted(glob.glob(sys.argv[1] + "/Ref2VA/transformer/model*.saf
 # ---------- 7. 原生训练入口 ----------
 # sync_each_batch=true：用户已明确同意；使用仓库原生参数。
 # disable_model_save：分支原生参数，关闭所有模型保存。
-# 开启普通梯度检查点；没有CPU/disk/optimizer/activation offload。
+# 默认开启普通梯度检查点；FA 激活缓存由上面的层数参数选择。
 # 参数输出在日志中可直接审阅。
 printf 'node_rank=%s nodes=%s world_size=%s microbatch=%s accumulation=%s global_batch=%s\n' \
     "$NODE_RANK" "$NNODES" "$WORLD_SIZE" "$MICRO_BATCH_SIZE" "$GRAD_ACCUM_STEPS" "$GLOBAL_BATCH_SIZE"
@@ -170,7 +182,7 @@ exec "$PYTHON_BIN" -m accelerate.commands.launch \
     --main_process_port "$MASTER_PORT" \
     examples/minimax_h3/model_training/train.py \
     --synthetic_inputs \
-    "${COMPILE_ARGS[@]}" \
+    "${COMPILE_ARGS[@]}" "${ACTIVATION_ARGS[@]}" \
     --dataset_repeat "$DATASET_REPEAT" \
     --dataset_num_workers 0 \
     --height "$HEIGHT" --width "$WIDTH" --num_frames "$NUM_FRAMES" \
