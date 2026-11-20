@@ -34,9 +34,13 @@ GLOBAL_BATCH_SIZE=64
 # 仓库当前 DataLoader 的 microbatch 固定为 1。
 MICRO_BATCH_SIZE=1
 GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / WORLD_SIZE / MICRO_BATCH_SIZE))
-TRAIN_STEPS=30
-# 合成样本总次数：1920；4机32卡时每rank处理60次，累积2次更新一次。
-DATASET_REPEAT=$((TRAIN_STEPS * GLOBAL_BATCH_SIZE))
+TRAIN_STEPS="${TRAIN_STEPS:-30}"  # optimizer 更新次数，所有节点取相同值。
+if [[ ! "$TRAIN_STEPS" =~ ^0*[1-9][0-9]*$ ]]; then
+    echo "TRAIN_STEPS 必须为正整数。" >&2
+    exit 1
+fi
+# 每次更新消费一个 global batch；默认 30 步 × 64 = 1920 个合成样本。
+DATASET_REPEAT=$((10#$TRAIN_STEPS * GLOBAL_BATCH_SIZE))
 HEIGHT=720
 WIDTH=1280
 NUM_FRAMES=240  # 24fps、10秒；合成输入不经过 VAE，不要求 17n+5。
@@ -169,8 +173,8 @@ print(json.dumps([sorted(glob.glob(sys.argv[1] + "/Ref2VA/transformer/model*.saf
 # disable_model_save：分支原生参数，关闭所有模型保存。
 # 默认开启普通梯度检查点；FA 激活缓存由上面的层数参数选择。
 # 参数输出在日志中可直接审阅。
-printf 'node_rank=%s nodes=%s world_size=%s microbatch=%s accumulation=%s global_batch=%s\n' \
-    "$NODE_RANK" "$NNODES" "$WORLD_SIZE" "$MICRO_BATCH_SIZE" "$GRAD_ACCUM_STEPS" "$GLOBAL_BATCH_SIZE"
+printf 'node_rank=%s nodes=%s world_size=%s microbatch=%s accumulation=%s global_batch=%s train_steps=%s dataset_repeat=%s\n' \
+    "$NODE_RANK" "$NNODES" "$WORLD_SIZE" "$MICRO_BATCH_SIZE" "$GRAD_ACCUM_STEPS" "$GLOBAL_BATCH_SIZE" "$TRAIN_STEPS" "$DATASET_REPEAT"
 cd "$REPO_DIR"
 set -x
 exec "$PYTHON_BIN" -m accelerate.commands.launch \
