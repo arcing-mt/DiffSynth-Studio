@@ -11,6 +11,41 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import checkpoint
 
 
+class _Transfer:
+    """Hold storage until its allocation stream has joined an async copy."""
+
+    def __init__(self, tensors, owner, done):
+        self.tensors = list(tensors)
+        self.owner = owner
+        self.done = done
+        # Also join before releasing storage if a prefetched graph is dropped.
+        self.finish = weakref.finalize(self, self._finish, self.tensors, owner, done)
+
+    @staticmethod
+    def _finish(tensors, owner, done):
+        owner.wait_event(done)
+        tensors.clear()
+
+    def take(self):
+        tensors = tuple(self.tensors)
+        self.finish()
+        return tensors
+
+
+class _PrefetchCleanup:
+    """Discard unused prefetches when a backward task completes or is aborted."""
+
+    def __init__(self, entries):
+        self.finish = weakref.finalize(self, self._finish, [weakref.ref(e) for e in entries if e is not None])
+
+    @staticmethod
+    def _finish(entries):
+        for ref in entries:
+            entry = ref()
+            if entry is not None:
+                entry.discard_prefetch()
+
+
 class _HostResult:
     def __init__(self, tensors, streams):
         output, lse, mask = tensors
@@ -18,6 +53,7 @@ class _HostResult:
         self.layout = [(t.shape, t.stride()) for t in (output, lse)]
         self.device = output.device
         self.streams = streams
+        self.producer = torch.musa.current_stream(self.device)
         self.prefetched = None
         self.lock = threading.Lock()
         # Use the MUSA pinned caching allocator. torch_musa's async copy records
@@ -25,41 +61,74 @@ class _HostResult:
         self.host = [torch.empty(t.numel(), device="cpu", dtype=t.dtype, pin_memory=True)
                      for t in (output, lse)]
         d2h, _ = streams
-        d2h.wait_stream(torch.musa.current_stream(self.device))
-        with torch.no_grad(), torch.musa.stream(d2h):
-            for src, dst in zip((output, lse), self.host):
-                # BHSD can be dense BSHD physical storage. Both DMA endpoints
-                # must be contiguous and same dtype to avoid a layout kernel.
-                dst.copy_(src.as_strided((src.numel(),), (1,)), non_blocking=True)
-                src.record_stream(d2h)
-            self.downloaded = d2h.record_event()
+        d2h.wait_stream(self.producer)
+        try:
+            with torch.no_grad(), torch.musa.stream(d2h):
+                for src, dst in zip((output, lse), self.host):
+                    # Preserve dense physical layout so this remains a DMA copy.
+                    dst.copy_(src.as_strided((src.numel(),), (1,)), non_blocking=True)
+                self.downloaded = d2h.record_event()
+            self.source = _Transfer([output.detach(), lse.detach()], self.producer, self.downloaded)
+        except BaseException:
+            # Source arguments stay alive through this join even on a partial copy.
+            self.producer.wait_stream(d2h)
+            raise
 
-    def _prefetch(self):
+    def finish_forward(self):
+        # Called after the block's remaining forward work has been submitted.
+        self.source.finish()
+
+    def _prefetch(self, consumer):
+        if self.prefetched is not None and self.prefetched.owner != consumer:
+            # Autograd normally uses the original forward stream. If replay is
+            # requested on another stream, rebuild there rather than allowing
+            # a side-stream consumer to escape the allocation owner's lifetime.
+            self.prefetched.finish()
+            self.prefetched = None
         if self.prefetched is not None:
             return
         _, h2d = self.streams
-        h2d.wait_event(self.downloaded)
         restored = []
-        with torch.no_grad(), torch.musa.stream(h2d):
+        # Allocate on the future consumer, not on the copy stream. Recomputed
+        # O/LSE remain live through FA backward via autograd's own references;
+        # every subsequent use/reuse is then ordered on this allocation stream.
+        with torch.no_grad(), torch.musa.stream(consumer):
             for src, (shape, stride) in zip(self.host, self.layout):
                 flat = torch.empty_like(src, device=self.device)
-                flat.copy_(src, non_blocking=True)
                 restored.append(flat.as_strided(shape, stride))
-            self.prefetched = (restored, h2d.record_event())
+        # Cached allocations may still be in use by earlier consumer-stream
+        # kernels, so DMA must also wait for their prior use before overwriting.
+        h2d.wait_stream(consumer)
+        h2d.wait_event(self.downloaded)
+        try:
+            with torch.no_grad(), torch.musa.stream(h2d):
+                for src, dst in zip(self.host, restored):
+                    dst.as_strided((dst.numel(),), (1,)).copy_(src, non_blocking=True)
+                uploaded = h2d.record_event()
+            self.prefetched = _Transfer(restored, consumer, uploaded)
+        except BaseException:
+            consumer.wait_stream(h2d)
+            raise
 
     def prefetch(self):
         with self.lock:
-            self._prefetch()
+            self._prefetch(self.producer)
+
+    def discard_prefetch(self):
+        with self.lock:
+            if self.prefetched is not None:
+                self.prefetched.finish()
+                self.prefetched = None
 
     def restore(self):
-        with self.lock:
-            self._prefetch()
-            tensors, event = self.prefetched
-            self.prefetched = None
         consumer = torch.musa.current_stream(self.device)
-        consumer.wait_event(event)
-        for tensor in tensors:
-            tensor.record_stream(consumer)
+        with self.lock:
+            self._prefetch(consumer)
+            # Join before handing ownership to autograd. Do not release or
+            # overwrite these tensors at checkpoint replay exit: FA backward
+            # still needs them after replay has returned (or stopped early).
+            tensors = self.prefetched.take()
+            self.prefetched = None
         return (*tensors, self.mask)
 
 
@@ -107,7 +176,19 @@ class _LayerCache:
                 with _ReplayFlash(op, result):
                     return op(q, k, v, scale=scale)[0]
 
-            return block(x, segment_attention=segment_attention, **block_kwargs)
+            try:
+                return block(x, segment_attention=segment_attention, **block_kwargs)
+            finally:
+                if self.on_host:
+                    for entry in self.entries:
+                        if entry is not None:
+                            if replay is None:
+                                entry.finish_forward()
+                            else:
+                                # Includes early-stop replay and failures. Only
+                                # unused prefetches are released here; restored
+                                # tensors belong to the original autograd graph.
+                                entry.discard_prefetch()
 
         return checkpoint(run, hidden, use_reentrant=False, **kwargs)
 
@@ -117,6 +198,13 @@ class _LayerCache:
         def prefetch(grad):
             cache = owner()
             if cache is not None:
+                cleanup = _PrefetchCleanup(cache.entries)
+                # Partial autograd.grad may never replay the prefetched block.
+                # The callback owns the cleanup guard until task completion;
+                # its finalizer also runs if the engine discards an aborted task.
+                torch.autograd.Variable._execution_engine.queue_callback(
+                    lambda cleanup=cleanup: cleanup.finish()
+                )
                 for entry in cache.entries:
                     if entry is not None:
                         entry.prefetch()
@@ -134,6 +222,7 @@ class H3ActivationOffload:
             raise ValueError(f"H3 CPU/GPU activation layer counts must be nonnegative and sum to at most {depth}.")
         if not math.isfinite(host_gib) or host_gib < 0 or (cpu_layers and host_gib == 0):
             raise ValueError("H3 activation host budget must be finite and positive when CPU layers are enabled.")
+        self.depth = depth
         self.cpu_layers = cpu_layers
         self.gpu_start = depth - gpu_layers
         self.host_limit = int(host_gib * 2**30)
@@ -181,6 +270,11 @@ class H3ActivationOffload:
                 output = cache.checkpoint(block, hidden, kwargs)
             else:
                 output = checkpoint(block, hidden, use_reentrant=False, **kwargs)
+            if on_host and index == self.depth - 1:
+                # Bootstrap backward's first restore before replay starts. Put
+                # this copy ahead of the previous block's lookahead in the DMA
+                # queue; both can overlap this block's recomputation prefix.
+                cache.prefetch_at_backward(output)
             if previous is not None:
                 previous.prefetch_at_backward(output)
             previous = cache if on_host else None
